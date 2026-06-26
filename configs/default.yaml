@@ -1,0 +1,15 @@
+# DANTE — all hyperparameters in one place.
+
+biencoder:
+  model_name: "answerdotai/ModernBERT-base"
+  max_seq_length: 256           # product texts are short
+  epochs: 3
+  batch_size: 128               # effective batch via GradCache if OOM
+  learning_rate: 2e-5
+  warmup_ratio: 0.1
+  scheduler: cosine
+  loss: MultipleNegativesRankingLoss  # with GISTEmbed if available in ST 5.x
+  mining: hard                  # mine hard negatives from BM25
+  num_hard_negatives: 5         # per query
+  eval_metric: "ndcg@10"
+  output_dim: 768               # mean pooling, no projection head
