@@ -48,6 +48,33 @@ CLEAN UP WHEN DONE  (safe — only touches THIS volume)
     modal volume delete  dante-artifacts            # nuke everything (final)
 
     Back up the weights (volume get + upload to HF/Kaggle) BEFORE deleting.
+
+================================================================================
+IF A STAGE FAILS (CONTINGENCIES)
+================================================================================
+GENERAL RULE: every stage is idempotent and writes to the volume, so the universal
+fallback is "fix the cause and re-run just that `--stage`." Data is cached, the HF
+download is cached on the volume, and the trainer checkpoints to
+`/artifacts/biencoder_ckpts` every 500 steps.
+
+  * Modal preemption / timeout during training
+        → just re-run `modal run modal_train.py --stage train`. Prepared data is on
+          the volume; resume training from the latest checkpoint dir if needed.
+  * GPU OOM (rare on A100-80GB)
+        → lower batch: `--stage train --batch_size 64` (then 32). As a last resort set
+          gradient_checkpointing=True in train_biencoder() and/or drop max_seq_length.
+  * ESCI download 404 / schema drift / labels not the expected words
+        → verify columns first (see RISKS R1); fall back to the authoritative source
+          `git clone https://github.com/amazon-science/esci-data` and load its parquet.
+  * HF rate-limit / flaky network
+        → set HUGGING_FACE_HUB_TOKEN in the env and re-run; the volume cache means you
+          don't re-download what already landed.
+  * Dependency / import failure (e.g. ModernBERT)
+        → ensure transformers>=4.48 + sentence-transformers>=5 (already pinned in the
+          image); the model loads with attn_implementation="sdpa" to avoid flash-attn.
+  * "0 usable pairs" after filtering
+        → the label/locale/small_version filter is too strict for this mirror; print
+          ds.unique("esci_label") and relax `_is_positive` / the small_version gate.
 ================================================================================
 """
 
