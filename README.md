@@ -44,3 +44,30 @@ TODO: end-to-end reproduction in one command (see `scripts/train_all.sh`).
 ```
 bash scripts/train_all.sh
 ```
+
+## Train the bi-encoder on Modal (A100)
+
+`modal_train.py` is a self-contained Modal job that fine-tunes the ModernBERT
+bi-encoder on ESCI. It is fully isolated — its own app (`dante-train`) and volume
+(`dante-artifacts`), **no secrets attached**, no database, no shared state with any
+other project on your Modal workspace. (SPLADE and ColBERT use pretrained checkpoints,
+so the bi-encoder is the only thing that needs an A100.)
+
+```
+pip install modal && modal token new          # one-time auth
+
+modal run modal_train.py --stage all --limit 5000 --epochs 1   # quick smoke test
+modal run modal_train.py --stage all                            # full run (~1-1.5h A100)
+```
+
+Pull the trained model to your machine (then push to HF Hub / Kaggle — not git):
+
+```
+modal volume get dante-artifacts /biencoder_final ./models/dante_biencoder
+```
+
+Clean up when done (only touches this volume):
+
+```
+modal volume delete dante-artifacts
+```
