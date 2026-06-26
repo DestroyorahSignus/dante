@@ -128,14 +128,19 @@ def prepare_data(limit: int = 0):
     label_col = next((c for c in ("esci_label", "label", "gain") if c in cols), None)
     if label_col is None:
         raise RuntimeError(f"Could not find an ESCI label column in {cols}")
+    has_small = "small_version" in cols  # the mirror ships the reduced-set flag
 
     def _keep(row):
-        if locale_col and str(row.get(locale_col) or "").lower() not in ("us", "en"):
+        # Restrict to the reduced (~1.1M) set; the full set is ~2.6M and blows the budget.
+        if has_small and not row.get("small_version"):
             return False
+        if locale_col and str(row.get(locale_col) or "").lower() != "us":
+            return False
+        # ESCI labels are full words (Exact/Substitute/Complement/Irrelevant), not E/S/C/I.
         return _is_positive(row.get(label_col))
 
     ds = ds.filter(_keep, num_proc=8)
-    print(f"[data] positive English rows: {len(ds):,}")
+    print(f"[data] positive US reduced-set rows: {len(ds):,}")
 
     if limit and limit > 0:
         ds = ds.select(range(min(limit, len(ds))))
