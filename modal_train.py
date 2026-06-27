@@ -92,26 +92,27 @@ ARTIFACTS = "/artifacts"
 image = (
     modal.Image.debian_slim(python_version="3.11")
     .pip_install(
-        # Pinned to the exact versions validated on Modal 2026-06-28 (data + train
-        # smoke both passed) for reproducibility — see DANTE_BUILD_PLAN.md §9.
+        # transformers 4.x era stack. ColBERT (answerai-colbert-small-v1, via rerankers
+        # or pylate) relies on transformers-4.x internals that 5.x REMOVED
+        # (`generate_model_card`, `all_tied_weights_keys`) → on transformers 5.12 the
+        # reranker silently no-ops. ModernBERT + ST + MNRL training are equally happy on
+        # 4.x (and warmup_ratio is native, no deprecation). torch/faiss/bm25 stay pinned;
+        # transformers<5 + ST<5 are constrained and the rest is left to pip to resolve a
+        # consistent set — RE-PIN to the resolved versions after the smoke re-validates.
         "torch==2.12.1",
-        "transformers==5.12.1",        # ModernBERT works; warmup_ratio warns but is honored
-        "sentence-transformers==5.6.0",
-        "datasets==5.0.0",
-        "accelerate==1.14.0",
+        "transformers>=4.48,<5",       # >=4.48 for ModernBERT; <5 for ColBERT compat
+        "sentence-transformers<5",     # resolves to the 3.x line, transformers-4.x compatible
+        "datasets>=2.19",
+        "accelerate>=0.30",
         "faiss-cpu==1.14.3",
-        "numpy==2.4.6",
-        "pandas==3.0.3",               # data prep: split-by-query, qrels/catalog build
+        "numpy<2.3",
+        "pandas>=2.0",                 # data prep: split-by-query, qrels/catalog build
         "wandb",                       # experiment tracking (see train_biencoder)
         # --- index/ablation/preflight stages (DANTE_BUILD_PLAN §4/§5) ---
         "rank-bm25==0.2.2",            # BM25 lexical leg (§4.1)
-        "scipy==1.16.0",               # CSR sparse matmul for SPLADE scoring (R3)
-        # ColBERT reranker (§4.5) via AnswerDotAI's `rerankers` — purpose-built for
-        # answerai-colbert-small-v1 and dependency-light. We use this instead of
-        # pylate, which couples to sentence-transformers' internal API and broke on
-        # the pinned ST 5.6 (`generate_model_card` import error → reranker no-op).
-        # Left unpinned; the colbert_reranker keeps a graceful identity fallback so
-        # the ablation never crashes even if this leg fails to load.
+        "scipy>=1.11",                 # CSR sparse matmul for SPLADE scoring (R3)
+        # ColBERT reranker (§4.5) via AnswerDotAI's `rerankers` (answerai-colbert-small-v1).
+        # colbert_reranker keeps a graceful identity fallback so the ablation never crashes.
         "rerankers[transformers]",
     )
     .env({"HF_HOME": f"{ARTIFACTS}/hf", "TOKENIZERS_PARALLELISM": "false"})
