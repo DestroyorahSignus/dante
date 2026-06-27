@@ -56,9 +56,16 @@ so the bi-encoder is the only thing that needs an A100.)
 ```
 pip install modal && modal token new          # one-time auth
 
+modal run modal_train.py --stage data                          # build train/eval data only
 modal run modal_train.py --stage all --limit 5000 --epochs 1   # quick smoke test
 modal run modal_train.py --stage all                            # full run (~1-1.5h A100)
 ```
+
+The `data` stage produces **leakage-free** artifacts on the volume: `train/` + `val/`
+(MNRL pairs, **split by query** so no query is in both), plus the eval set the ablation
+needs — `catalog.parquet` (full retrieval pool), `qrels.json` (graded Exact=3…Irrelevant=0)
+and `queries.json`. Train/test are query-disjoint (asserted), and positives are deduped +
+capped per query.
 
 Pull the trained model to your machine (then push to HF Hub / Kaggle — not git):
 

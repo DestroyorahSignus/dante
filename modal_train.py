@@ -99,6 +99,7 @@ image = (
         "accelerate>=0.30",
         "faiss-cpu>=1.7.4",
         "numpy",
+        "pandas>=2.0",        # data prep: split-by-query, qrels/catalog build
     )
     .env({"HF_HOME": f"{ARTIFACTS}/hf", "TOKENIZERS_PARALLELISM": "false"})
 )
@@ -116,13 +117,15 @@ WARMUP_RATIO = 0.1
 #  DANTE_BUILD_PLAN.md §4.2 and the "common pitfalls" note about brute-force.)
 ESCI_DATASET = "tasksource/esci"
 
+# Graded relevance (§3.4) — labels are full WORDS on this mirror, not E/S/C/I.
+# Positives for contrastive training are grade >= 2 (Exact, Substitute).
+GRADE = {"exact": 3, "substitute": 2, "complement": 1, "irrelevant": 0,
+         "e": 3, "s": 2, "c": 1, "i": 0}
+POS_GRADE = 2  # Exact + Substitute count as positives
 
-def _is_positive(label) -> bool:
-    """ESCI label counts as a positive pair if Exact or Substitute (§3.4)."""
-    if label is None:
-        return False
-    l = str(label).strip().lower()
-    return l in ("e", "s", "exact", "substitute")
+
+def _grade(label) -> int:
+    return GRADE.get(str(label).strip().lower(), 0)
 
 
 def _product_text(row) -> str:
@@ -134,60 +137,141 @@ def _product_text(row) -> str:
     return f"{title} [SEP] {brand} [SEP] {bullet} [SEP] {desc}".strip()
 
 
-@app.function(image=image, volumes={ARTIFACTS: vol}, timeout=60 * 60, cpu=8.0)
-def prepare_data(limit: int = 0):
-    """Download ESCI (English), build positive (query, product) pairs, save to volume.
+@app.function(image=image, volumes={ARTIFACTS: vol}, timeout=90 * 60, cpu=8.0, memory=32768)
+def prepare_data(limit: int = 0, max_pos_per_query: int = 16, val_frac: float = 0.01):
+    """Build leakage-free DANTE train/eval data from ESCI and save to the volume.
 
-    Output: ``{ARTIFACTS}/data/train`` and ``{ARTIFACTS}/data/val`` (HF datasets,
-    columns ``anchor`` + ``positive``).
+    Produces (under {ARTIFACTS}/data/):
+      train/            HF dataset [anchor, positive]   — MNRL training pairs
+      val/              HF dataset [anchor, positive]   — eval-loss monitor (query-disjoint)
+      catalog.parquet   [product_id, product_text]      — retrieval pool for recall@K
+      qrels.json        {query_id: {product_id: grade}} — graded (Exact=3..Irrelevant=0)
+      queries.json      {query_id: query_text}          — TEST queries
+      stats.json        counts + the leakage assertion result
+
+    Correctness properties this fixes:
+      * Split is BY QUERY (official `split` column if the mirror has it, else a stable
+        hash of query_id) — no query appears in both train and test (NO leakage).
+      * Eval keeps ALL graded labels + a full catalog, so recall@K / nDCG are honest
+        (retrieve against the whole catalog, not just the positives).
+      * Positives (grade>=2) are deduped and capped per query so a few prolific queries
+        don't dominate the contrastive batch.
     """
+    import hashlib
+    import json
     import os
-    from datasets import load_dataset
 
+    import pandas as pd
+    from datasets import Dataset, load_dataset
+
+    os.makedirs(f"{ARTIFACTS}/data", exist_ok=True)
     os.makedirs(f"{ARTIFACTS}/hf", exist_ok=True)
 
     print(f"[data] loading {ESCI_DATASET} ...")
     ds = load_dataset(ESCI_DATASET, split="train")
-    print(f"[data] raw rows: {len(ds):,} | columns: {ds.column_names}")
-
     cols = ds.column_names
+    print(f"[data] raw rows: {len(ds):,} | columns: {cols}")
+
     locale_col = "product_locale" if "product_locale" in cols else None
     label_col = next((c for c in ("esci_label", "label", "gain") if c in cols), None)
     if label_col is None:
         raise RuntimeError(f"Could not find an ESCI label column in {cols}")
-    has_small = "small_version" in cols  # the mirror ships the reduced-set flag
+    qid_col = "query_id" if "query_id" in cols else None
+    pid_col = "product_id" if "product_id" in cols else None
+    has_small = "small_version" in cols
+    has_split = "split" in cols  # official ESCI query-level split, if the mirror kept it
 
-    def _keep(row):
-        # Restrict to the reduced (~1.1M) set; the full set is ~2.6M and blows the budget.
-        if has_small and not row.get("small_version"):
+    # Base filter: reduced set + US, but KEEP ALL LABELS (eval needs negatives too).
+    def _keep(r):
+        if has_small and not r.get("small_version"):
             return False
-        if locale_col and str(row.get(locale_col) or "").lower() != "us":
+        if locale_col and str(r.get(locale_col) or "").lower() != "us":
             return False
-        # ESCI labels are full words (Exact/Substitute/Complement/Irrelevant), not E/S/C/I.
-        return _is_positive(row.get(label_col))
+        return bool(r.get("query"))
 
     ds = ds.filter(_keep, num_proc=8)
-    print(f"[data] positive US reduced-set rows: {len(ds):,}")
-
+    print(f"[data] US reduced-set rows (all labels): {len(ds):,}")
     if limit and limit > 0:
         ds = ds.select(range(min(limit, len(ds))))
         print(f"[data] limited to {len(ds):,} rows (smoke test)")
 
-    ds = ds.map(
-        lambda r: {"anchor": str(r.get("query") or ""), "positive": _product_text(r)},
-        num_proc=8,
-        remove_columns=[c for c in ds.column_names],
-    )
-    # Drop empties + exact dupes.
-    ds = ds.filter(lambda r: len(r["anchor"]) > 0 and len(r["positive"]) > 4, num_proc=8)
-    print(f"[data] usable pairs: {len(ds):,}")
+    # Project to needed columns and assign a WHOLE-QUERY train/test flag.
+    def _project(r):
+        qid = str(r.get(qid_col) if qid_col else (r.get("query") or ""))
+        if has_split and r.get("split") is not None:
+            is_test = str(r.get("split")).strip().lower() == "test"
+        else:  # deterministic ~10% hash split — stable across runs, whole-query
+            h = int(hashlib.md5(qid.encode("utf-8")).hexdigest(), 16)
+            is_test = (h % 10) == 0
+        return {
+            "query": str(r.get("query") or ""),
+            "query_id": qid,
+            "product_id": str(r.get(pid_col) or ""),
+            "product_text": _product_text(r),
+            "grade": _grade(r.get(label_col)),
+            "is_test": is_test,
+        }
 
-    split = ds.train_test_split(test_size=0.02, seed=42)
-    split["train"].save_to_disk(f"{ARTIFACTS}/data/train")
-    split["test"].save_to_disk(f"{ARTIFACTS}/data/val")
+    ds = ds.map(_project, num_proc=8, remove_columns=cols)
+    ds = ds.filter(
+        lambda r: len(r["query"]) > 0 and len(r["product_id"]) > 0 and len(r["product_text"]) > 4,
+        num_proc=8,
+    )
+    df = ds.to_pandas()
+
+    # Catalog = every unique product = the retrieval pool for recall@K.
+    catalog = df.drop_duplicates("product_id")[["product_id", "product_text"]]
+    catalog.to_parquet(f"{ARTIFACTS}/data/catalog.parquet", index=False)
+
+    train_df = df[~df["is_test"]]
+    test_df = df[df["is_test"]]
+
+    # Training positives: Exact+Substitute, deduped, capped per query.
+    pos = (train_df[train_df["grade"] >= POS_GRADE]
+           [["query_id", "query", "product_text"]]
+           .drop_duplicates(["query_id", "product_text"]))
+    pos = pos.groupby("query_id", group_keys=False).head(max_pos_per_query)
+    pos = pos.rename(columns={"query": "anchor", "product_text": "positive"})
+
+    # Query-disjoint val holdout (eval-loss only; the REAL eval is the test qrels).
+    uniq_q = pos["query_id"].drop_duplicates()
+    n_val_q = max(1, int(len(uniq_q) * val_frac)) if len(uniq_q) else 0
+    val_qids = set(uniq_q.sample(n=n_val_q, random_state=42)) if n_val_q else set()
+    val_pairs = pos[pos["query_id"].isin(val_qids)][["anchor", "positive"]]
+    trn_pairs = pos[~pos["query_id"].isin(val_qids)][["anchor", "positive"]]
+
+    Dataset.from_pandas(trn_pairs, preserve_index=False).save_to_disk(f"{ARTIFACTS}/data/train")
+    Dataset.from_pandas(val_pairs, preserve_index=False).save_to_disk(f"{ARTIFACTS}/data/val")
+
+    # Graded eval artifacts from the TEST split.
+    qrels: dict = {}
+    queries: dict = {}
+    for row in test_df.itertuples(index=False):
+        qrels.setdefault(row.query_id, {})[row.product_id] = int(row.grade)
+        queries[row.query_id] = row.query
+    with open(f"{ARTIFACTS}/data/qrels.json", "w") as f:
+        json.dump(qrels, f)
+    with open(f"{ARTIFACTS}/data/queries.json", "w") as f:
+        json.dump(queries, f)
+
+    # Leakage guard: train and test query sets MUST be disjoint.
+    leak = set(train_df["query_id"].unique()) & set(test_df["query_id"].unique())
+    assert not leak, f"QUERY LEAKAGE: {len(leak)} queries in both splits (e.g. {list(leak)[:3]})"
+
+    stats = {
+        "train_pairs": int(len(trn_pairs)),
+        "val_pairs": int(len(val_pairs)),
+        "catalog_products": int(len(catalog)),
+        "test_queries": int(len(queries)),
+        "test_judgements": int(sum(len(v) for v in qrels.values())),
+        "split_source": "official 'split' column" if has_split else "hash(query_id)%10",
+        "leakage": len(leak),
+    }
+    with open(f"{ARTIFACTS}/data/stats.json", "w") as f:
+        json.dump(stats, f, indent=2)
     vol.commit()
-    print(f"[data] saved: train={len(split['train']):,}  val={len(split['test']):,}")
-    return {"train": len(split["train"]), "val": len(split["test"])}
+    print(f"[data] {stats}")
+    return stats
 
 
 @app.function(image=image, volumes={ARTIFACTS: vol}, gpu="A100-80GB", timeout=4 * 60 * 60)
