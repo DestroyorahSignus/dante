@@ -103,8 +103,23 @@ image = (
         "numpy==2.4.6",
         "pandas==3.0.3",               # data prep: split-by-query, qrels/catalog build
         "wandb",                       # experiment tracking (see train_biencoder)
+        # --- index/ablation/preflight stages (DANTE_BUILD_PLAN §4/§5) ---
+        "rank-bm25==0.2.2",            # BM25 lexical leg (§4.1)
+        "scipy==1.16.0",               # CSR sparse matmul for SPLADE scoring (R3)
+        # pylate = modern ST-native ColBERT for the reranker (§4.5). It is left
+        # UNPINNED here on purpose: if pip would force-downgrade the pinned
+        # torch/transformers above to satisfy pylate, the colbert_reranker's
+        # graceful identity-fallback keeps the ablation running, so the image must
+        # NOT break. If you see a downgrade in the build log, either pin a pylate
+        # release compatible with torch 2.12 / transformers 5.12 or drop this line
+        # and rely on the fallback (the "+ ColBERT" row then == the fused row).
+        "pylate",
     )
     .env({"HF_HOME": f"{ARTIFACTS}/hf", "TOKENIZERS_PARALLELISM": "false"})
+    # Ship the dante/ source package so the index/ablation/preflight stages can
+    # `from dante.serving... import ...`. modal_train.py sits at the repo root
+    # alongside the dante/ package dir.
+    .add_local_python_source("dante")
 )
 
 # ---- Hyperparameters (mirror configs/default.yaml :: biencoder) -------------
@@ -354,14 +369,159 @@ def train_biencoder(epochs: int = 3, batch_size: int = 128):
     return out
 
 
+# A default config that mirrors configs/default.yaml but points at the volume.
+# (The package code reads nested dicts, so this is passed straight through.)
+def _default_config() -> dict:
+    return {
+        "biencoder": {"path": f"{ARTIFACTS}/biencoder_final"},
+        "splade": {"model": "naver/splade-v3", "max_length": 256},
+        "colbert": {"model": "answerdotai/answerai-colbert-small-v1"},
+        "serving": {
+            "catalog_path": f"{ARTIFACTS}/data/catalog.parquet",
+            "index_dir": f"{ARTIFACTS}/index",
+            "queries_path": f"{ARTIFACTS}/data/queries.json",
+            "rrf_k": 60, "top_n": 200, "leg_top_k": 1000,
+        },
+        "eval": {"ks": [10, 50, 100, 200], "max_queries": 2000, "seed": 42,
+                 "results_path": f"{ARTIFACTS}/ablation_results.json",
+                 "queries_path": f"{ARTIFACTS}/data/queries.json"},
+    }
+
+
+@app.function(image=image, volumes={ARTIFACTS: vol}, gpu="A100-80GB", timeout=2 * 60 * 60)
+def build_index():
+    """Build dense FAISS + BM25 + SPLADE-CSR indices → ``/artifacts/index/`` (§4.6)."""
+    from dante.serving.index_builder import build_indices
+
+    paths = build_indices(_default_config())
+    vol.commit()
+    print(f"[index] committed: {paths}")
+    return paths
+
+
+@app.function(image=image, volumes={ARTIFACTS: vol}, gpu="A100-80GB", timeout=4 * 60 * 60)
+def run_ablation():
+    """Load the index + qrels + queries → run the 7-config ablation (§5.2)."""
+    import json
+
+    from dante.eval.evaluate import run_all_ablations
+    from dante.serving.search_engine import DanteSearchEngine
+
+    cfg = _default_config()
+    with open(f"{ARTIFACTS}/data/qrels.json") as f:
+        qrels = json.load(f)
+    with open(f"{ARTIFACTS}/data/queries.json") as f:
+        queries = json.load(f)
+
+    engine = DanteSearchEngine(cfg)
+    out = run_all_ablations(
+        engine, queries, qrels,
+        ks=tuple(cfg["eval"]["ks"]),
+        max_queries=cfg["eval"]["max_queries"],
+        seed=cfg["eval"]["seed"],
+    )
+    with open(cfg["eval"]["results_path"], "w") as f:
+        json.dump({"results": out["results"], "n_queries": out["n_queries"]}, f, indent=2)
+    vol.commit()
+    print(f"[ablation] wrote {cfg['eval']['results_path']}")
+    return out["results"]
+
+
+@app.function(image=image, volumes={ARTIFACTS: vol}, gpu="A100-80GB", timeout=60 * 60)
+def preflight(n: int = 2000):
+    """GPU sanity on the volume artifacts BEFORE trusting real-query numbers.
+
+    1. FAISS self-test: encode N catalog docs, query with a doc's own text → expect
+       that doc to come back rank-1 (validates encode+normalize+IndexFlatIP, R7).
+    2. Retriever ceiling: query the FULL dense index with each product's own
+       product_text → report rank-1 / rank-10 self-hit rate (the encoder/index
+       ceiling; if low, real-query recall can't be trusted — fix first).
+    3. SPLADE expansion sanity: a query expands into >0 sensible terms.
+    """
+    import json
+
+    import faiss
+    import numpy as np
+    import pandas as pd
+    from sentence_transformers import SentenceTransformer
+
+    from dante.models.biencoder import build_dense_index, dense_search
+    from dante.models.splade import SpladeEncoder, visualize_expansion
+
+    cfg = _default_config()
+    catalog = pd.read_parquet(cfg["serving"]["catalog_path"])
+    ids = catalog["product_id"].astype(str).tolist()
+    texts = catalog["product_text"].astype(str).tolist()
+    model = SentenceTransformer(cfg["biencoder"]["path"])
+
+    # --- 1. FAISS self-test on a small slice ---
+    m = min(n, len(ids))
+    sub_ids, sub_texts = ids[:m], texts[:m]
+    sub_index, _ = build_dense_index(model, sub_ids, sub_texts)
+    # unit-norm assert on a fresh encode (R7)
+    emb = model.encode(sub_texts[:5], convert_to_numpy=True).astype("float32")
+    faiss.normalize_L2(emb)
+    assert np.allclose(np.linalg.norm(emb, axis=1), 1.0, atol=1e-4), "embeddings not unit-norm"
+    self_hits = sum(
+        1 for i in range(m)
+        if dense_search(model, sub_index, sub_ids, sub_texts[i], top_k=1)[0][0] == sub_ids[i]
+    )
+    faiss_selftest = self_hits / m
+
+    # --- 2. Retriever ceiling against the FULL dense index ---
+    full_index, _ = build_dense_index(model, ids, texts)
+    sample = list(range(len(ids)))
+    if len(sample) > n:
+        rng = np.random.default_rng(42)
+        sample = rng.choice(len(ids), size=n, replace=False).tolist()
+    r1 = r10 = 0
+    for i in sample:
+        hits = [pid for pid, _ in dense_search(model, full_index, ids, texts[i], top_k=10)]
+        if hits and hits[0] == ids[i]:
+            r1 += 1
+        if ids[i] in hits:
+            r10 += 1
+    ceiling = {"rank1": r1 / len(sample), "rank10": r10 / len(sample), "n": len(sample)}
+
+    # --- 3. SPLADE expansion sanity ---
+    splade = SpladeEncoder(model_name=cfg["splade"]["model"])
+    expansion = visualize_expansion("wireless bluetooth headphones", splade, top_k_terms=10)
+
+    report = {
+        "faiss_selftest_rank1": faiss_selftest,
+        "ceiling": ceiling,
+        "splade_expansion_terms": len(expansion),
+        "splade_expansion_sample": expansion[:5],
+    }
+    print(f"[preflight] {json.dumps(report, indent=2)}")
+    assert faiss_selftest > 0.95, f"FAISS self-test rank-1 too low: {faiss_selftest:.3f}"
+    assert len(expansion) > 0, "SPLADE produced no expansion terms"
+    return report
+
+
 @app.local_entrypoint()
 def main(stage: str = "all", epochs: int = 3, batch_size: int = 128, limit: int = 0):
-    """Orchestrate the pipeline. stage: 'all' | 'data' | 'train'."""
+    """Orchestrate the pipeline.
+
+    stage: 'all' | 'data' | 'train' | 'index' | 'ablation' | 'preflight'.
+    ('all' runs data + train; index/ablation/preflight are run explicitly so the
+     A100 index/eval passes don't fire on every smoke.)
+    """
+    valid = ("all", "data", "train", "index", "ablation", "preflight")
+    if stage not in valid:
+        raise SystemExit(f"unknown stage {stage!r}; use {'|'.join(valid)}")
     if stage in ("all", "data"):
         print("== STAGE: prepare_data ==")
         print(prepare_data.remote(limit=limit))
     if stage in ("all", "train"):
         print("== STAGE: train_biencoder ==")
         print(train_biencoder.remote(epochs=epochs, batch_size=batch_size))
-    if stage not in ("all", "data", "train"):
-        raise SystemExit(f"unknown stage {stage!r}; use all|data|train")
+    if stage == "index":
+        print("== STAGE: build_index ==")
+        print(build_index.remote())
+    if stage == "ablation":
+        print("== STAGE: run_ablation ==")
+        print(run_ablation.remote())
+    if stage == "preflight":
+        print("== STAGE: preflight ==")
+        print(preflight.remote())

@@ -13,3 +13,33 @@ biencoder:
   num_hard_negatives: 5         # per query
   eval_metric: "ndcg@10"
   output_dim: 768               # mean pooling, no projection head
+  # Path to the trained SentenceTransformer (modal_train.py saves here on the volume).
+  path: "/artifacts/biencoder_final"
+
+# Learned-sparse leg — pretrained SPLADE-v3 (Option A, 0h GPU; §4.3).
+splade:
+  model: "naver/splade-v3"
+  max_length: 256
+
+# Lexical leg — BM25 over the catalog (§4.1).
+bm25:
+  enabled: true
+
+# Late-interaction reranker — pretrained answerai-colbert-small-v1 (§4.5).
+colbert:
+  model: "answerdotai/answerai-colbert-small-v1"
+
+# Serving / index locations + fusion params (§4.6).
+serving:
+  catalog_path: "/artifacts/data/catalog.parquet"
+  index_dir: "/artifacts/index"
+  rrf_k: 60                     # RRF constant (§4.4)
+  top_n: 200                    # candidates handed to ColBERT after fusion
+  leg_top_k: 1000              # per-leg retrieval depth before fusion
+
+# Evaluation / ablation (§5).
+eval:
+  ks: [10, 50, 100, 200]
+  max_queries: 2000             # subsample test queries so ColBERT rerank stays in budget
+  seed: 42
+  results_path: "/artifacts/ablation_results.json"

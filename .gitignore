@@ -3,7 +3,10 @@ __pycache__/
 .venv/
 venv/
 *.egg-info/
-models/
+# Anchor to repo root: the repo-root ./models/ holds pulled-down trained weights
+# (gitignored), but the dante/models/ SOURCE PACKAGE must stay tracked. A bare
+# `models/` matched both and silently dropped the package — keep this anchored.
+/models/
 data/raw/
 .ipynb_checkpoints/
 .DS_Store
