@@ -92,14 +92,17 @@ ARTIFACTS = "/artifacts"
 image = (
     modal.Image.debian_slim(python_version="3.11")
     .pip_install(
-        "torch>=2.2",
-        "transformers>=4.48",          # ModernBERT support landed in 4.48
-        "sentence-transformers>=5.0.0",
-        "datasets>=2.19",
-        "accelerate>=0.30",
-        "faiss-cpu>=1.7.4",
-        "numpy",
-        "pandas>=2.0",        # data prep: split-by-query, qrels/catalog build
+        # Pinned to the exact versions validated on Modal 2026-06-28 (data + train
+        # smoke both passed) for reproducibility — see DANTE_BUILD_PLAN.md §9.
+        "torch==2.12.1",
+        "transformers==5.12.1",        # ModernBERT works; warmup_ratio warns but is honored
+        "sentence-transformers==5.6.0",
+        "datasets==5.0.0",
+        "accelerate==1.14.0",
+        "faiss-cpu==1.14.3",
+        "numpy==2.4.6",
+        "pandas==3.0.3",               # data prep: split-by-query, qrels/catalog build
+        "wandb",                       # experiment tracking (see train_biencoder)
     )
     .env({"HF_HOME": f"{ARTIFACTS}/hf", "TOKENIZERS_PARALLELISM": "false"})
 )
@@ -274,7 +277,15 @@ def prepare_data(limit: int = 0, max_pos_per_query: int = 16, val_frac: float = 
     return stats
 
 
-@app.function(image=image, volumes={ARTIFACTS: vol}, gpu="A100-80GB", timeout=4 * 60 * 60)
+@app.function(
+    image=image,
+    volumes={ARTIFACTS: vol},
+    gpu="A100-80GB",
+    timeout=4 * 60 * 60,
+    # W&B logging only. This secret holds ONLY WANDB_API_KEY — it does NOT expose the
+    # company Mongo secret. Runs log to the WANDB_PROJECT set below.
+    secrets=[modal.Secret.from_name("dante-wandb")],
+)
 def train_biencoder(epochs: int = 3, batch_size: int = 128):
     """Fine-tune ModernBERT on the prepared pairs with MNRL. Save to the volume.
 
@@ -289,6 +300,10 @@ def train_biencoder(epochs: int = 3, batch_size: int = 128):
         SentenceTransformerTrainingArguments,
     )
     from sentence_transformers.losses import MultipleNegativesRankingLoss
+
+    # W&B: the dante-wandb secret provides WANDB_API_KEY; log to a namespaced project
+    # (company entity, but kept under its own project so portfolio runs are separable).
+    os.environ.setdefault("WANDB_PROJECT", "dante-portfolio")
 
     train_path, val_path = f"{ARTIFACTS}/data/train", f"{ARTIFACTS}/data/val"
     if not os.path.isdir(train_path):
@@ -322,7 +337,8 @@ def train_biencoder(epochs: int = 3, batch_size: int = 128):
         save_total_limit=2,
         logging_steps=50,
         dataloader_num_workers=4,
-        report_to=[],  # no wandb/tensorboard — keep the job hermetic
+        report_to=["wandb"],  # log to W&B (dante-portfolio); key via dante-wandb secret
+        run_name=f"dante-biencoder-e{epochs}-bs{batch_size}",
     )
 
     trainer = SentenceTransformerTrainer(
