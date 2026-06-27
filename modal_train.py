@@ -92,28 +92,27 @@ ARTIFACTS = "/artifacts"
 image = (
     modal.Image.debian_slim(python_version="3.11")
     .pip_install(
-        # transformers 4.x era stack. ColBERT (answerai-colbert-small-v1, via rerankers
-        # or pylate) relies on transformers-4.x internals that 5.x REMOVED
-        # (`generate_model_card`, `all_tied_weights_keys`) → on transformers 5.12 the
-        # reranker silently no-ops. ModernBERT + ST + MNRL training are equally happy on
-        # 4.x (and warmup_ratio is native, no deprecation). torch/faiss/bm25 stay pinned;
-        # transformers<5 + ST<5 are constrained and the rest is left to pip to resolve a
-        # consistent set — RE-PIN to the resolved versions after the smoke re-validates.
+        # transformers 4.x era stack — PINNED to the versions validated on Modal
+        # 2026-06-28 (train + index + 7-config ablation incl. a working ColBERT all
+        # passed). ColBERT (answerai-colbert-small-v1 via rerankers) relies on
+        # transformers-4.x internals REMOVED in 5.x (`generate_model_card`,
+        # `all_tied_weights_keys`) → on 5.12 the reranker silently no-ops. ModernBERT +
+        # MNRL train fine on 4.x and warmup_ratio is native (no deprecation).
         "torch==2.12.1",
-        "transformers>=4.48,<5",       # >=4.48 for ModernBERT; <5 for ColBERT compat
-        "sentence-transformers<5",     # resolves to the 3.x line, transformers-4.x compatible
-        "datasets>=2.19",
-        "accelerate>=0.30",
+        "transformers==4.57.6",        # 4.x: ModernBERT works AND ColBERT loads
+        "sentence-transformers==4.1.0",
+        "datasets==5.0.0",
+        "accelerate==1.14.0",
         "faiss-cpu==1.14.3",
-        "numpy<2.3",
-        "pandas>=2.0",                 # data prep: split-by-query, qrels/catalog build
-        "wandb",                       # experiment tracking (see train_biencoder)
+        "numpy==2.2.6",
+        "pandas==3.0.3",               # data prep: split-by-query, qrels/catalog build
+        "wandb==0.28.0",               # experiment tracking (see train_biencoder)
         # --- index/ablation/preflight stages (DANTE_BUILD_PLAN §4/§5) ---
         "rank-bm25==0.2.2",            # BM25 lexical leg (§4.1)
-        "scipy>=1.11",                 # CSR sparse matmul for SPLADE scoring (R3)
-        # ColBERT reranker (§4.5) via AnswerDotAI's `rerankers` (answerai-colbert-small-v1).
+        "scipy==1.17.1",               # CSR sparse matmul for SPLADE scoring (R3)
+        # ColBERT reranker (§4.5) via AnswerDotAI's `rerankers` (answerai-colbert-small-v1);
         # colbert_reranker keeps a graceful identity fallback so the ablation never crashes.
-        "rerankers[transformers]",
+        "rerankers[transformers]==0.10.0",
     )
     .env({"HF_HOME": f"{ARTIFACTS}/hf", "TOKENIZERS_PARALLELISM": "false"})
     # Ship the dante/ source package so the index/ablation/preflight stages can
