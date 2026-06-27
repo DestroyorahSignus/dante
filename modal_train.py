@@ -374,7 +374,7 @@ def train_biencoder(epochs: int = 3, batch_size: int = 128):
 def _default_config() -> dict:
     return {
         "biencoder": {"path": f"{ARTIFACTS}/biencoder_final"},
-        "splade": {"model": "naver/splade-v3", "max_length": 256},
+        "splade": {"model": "naver/splade-cocondenser-ensembledistil", "max_length": 256},
         "colbert": {"model": "answerdotai/answerai-colbert-small-v1"},
         "serving": {
             "catalog_path": f"{ARTIFACTS}/data/catalog.parquet",

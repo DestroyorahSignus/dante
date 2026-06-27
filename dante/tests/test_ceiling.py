@@ -11,7 +11,7 @@ pytest.importorskip("transformers")
 pytest.importorskip("scipy")
 pytest.importorskip("torch")
 
-SPLADE_MODEL = "naver/splade-v3"
+SPLADE_MODEL = "naver/splade-cocondenser-ensembledistil"
 
 
 @pytest.fixture(scope="module")

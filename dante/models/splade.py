@@ -4,7 +4,7 @@
 SPLADE aggregation (``max`` over sequence of ``log1p(relu(logits))``). The catalog
 index stores all doc vectors as ONE ``scipy.sparse`` CSR matrix and scores a query
 with a single sparse matmul ``q @ doc_matrix.T`` (RISK R3) — never a per-doc Python
-loop. ``naver/splade-v3`` is used pretrained (0h GPU, plan default).
+loop. ``naver/splade-cocondenser-ensembledistil`` is used pretrained (0h GPU, plan default).
 """
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from __future__ import annotations
 class SpladeEncoder:
     """Encode text into a sparse SPLADE vector and run CSR-matmul catalog search."""
 
-    def __init__(self, model_name: str = "naver/splade-v3", device: str | None = None,
+    def __init__(self, model_name: str = "naver/splade-cocondenser-ensembledistil", device: str | None = None,
                  max_length: int = 256) -> None:
         from transformers import AutoModelForMaskedLM, AutoTokenizer
 

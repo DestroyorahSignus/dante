@@ -43,7 +43,7 @@ class DanteSearchEngine:
         catalog_path = _cfg(config, "serving", "catalog_path",
                             default="/artifacts/data/catalog.parquet")
         biencoder_path = _cfg(config, "biencoder", "path", default="/artifacts/biencoder_final")
-        splade_model = _cfg(config, "splade", "model", default="naver/splade-v3")
+        splade_model = _cfg(config, "splade", "model", default="naver/splade-cocondenser-ensembledistil")
         splade_maxlen = _cfg(config, "splade", "max_length", default=256)
 
         self.rrf_k = _cfg(config, "serving", "rrf_k", default=60)

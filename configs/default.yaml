@@ -18,7 +18,7 @@ biencoder:
 
 # Learned-sparse leg — pretrained SPLADE-v3 (Option A, 0h GPU; §4.3).
 splade:
-  model: "naver/splade-v3"
+  model: "naver/splade-cocondenser-ensembledistil"
   max_length: 256
 
 # Lexical leg — BM25 over the catalog (§4.1).

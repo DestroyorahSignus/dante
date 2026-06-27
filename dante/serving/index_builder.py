@@ -46,7 +46,7 @@ def build_indices(config) -> dict:
     catalog_path = _cfg(config, "serving", "catalog_path", default="/artifacts/data/catalog.parquet")
     index_dir = _cfg(config, "serving", "index_dir", default="/artifacts/index")
     biencoder_path = _cfg(config, "biencoder", "path", default="/artifacts/biencoder_final")
-    splade_model = _cfg(config, "splade", "model", default="naver/splade-v3")
+    splade_model = _cfg(config, "splade", "model", default="naver/splade-cocondenser-ensembledistil")
     splade_maxlen = _cfg(config, "splade", "max_length", default=256)
 
     os.makedirs(index_dir, exist_ok=True)
