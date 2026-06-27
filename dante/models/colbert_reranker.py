@@ -1,8 +1,9 @@
 """ColBERT late-interaction reranker — DANTE_BUILD_PLAN.md §4.5.
 
-Uses **pylate** (modern, ST-native ColBERT; lighter than ragatouille and friendlier
-to recent torch/transformers) to load ``answerdotai/answerai-colbert-small-v1`` and
-MaxSim-rerank the fused candidates.
+Uses AnswerDotAI's **`rerankers`** library to load ``answerdotai/answerai-colbert-small-v1``
+and MaxSim-rerank the fused candidates. We use `rerankers` (purpose-built for this model,
+dependency-light) rather than pylate, which couples to sentence-transformers' internal API
+and broke on the pinned ST 5.6 (`generate_model_card` import error → silent no-op).
 
 CRITICAL (plan D0.2): the ablation must NEVER crash because of ColBERT. Any failure
 — import error, model load failure, scoring error — logs a warning and returns the
@@ -38,19 +39,29 @@ def _candidate_text(c) -> str:
 
 
 def _load_model(model_name: str):
-    """Load (and cache) a pylate ColBERT model, or return None on any failure."""
+    """Load (and cache) a `rerankers` ColBERT model, or return None on any failure."""
     if model_name in _MODEL_CACHE:
         return _MODEL_CACHE[model_name]
     try:
-        from pylate import models as pylate_models  # type: ignore
+        from rerankers import Reranker  # type: ignore
 
-        model = pylate_models.ColBERT(model_name_or_path=model_name)
+        model = Reranker(model_name, model_type="colbert", verbose=0)
         _MODEL_CACHE[model_name] = model
         return model
     except Exception as exc:  # import error, download failure, etc.
         logger.warning("ColBERT load failed (%s) — using identity fallback.", exc)
         _MODEL_CACHE[model_name] = None
         return None
+
+
+def _result_index(r) -> int:
+    """Pull the (integer) doc_id back out of a rerankers Result, across API variants."""
+    doc = getattr(r, "document", None)
+    if doc is not None and getattr(doc, "doc_id", None) is not None:
+        return int(doc.doc_id)
+    if getattr(r, "doc_id", None) is not None:
+        return int(r.doc_id)
+    return int(getattr(r, "id", 0))
 
 
 def colbert_rerank(query: str, candidates: list, top_k: int = 20, model=None):
@@ -61,7 +72,7 @@ def colbert_rerank(query: str, candidates: list, top_k: int = 20, model=None):
         candidates: Candidate items — dicts with ``product_text`` (preferred),
             ``(product_id, ...)`` tuples, or strings. Order is the fused ranking.
         top_k: Number of reranked items to return.
-        model: An optional preloaded pylate ColBERT model (name or instance). If
+        model: An optional preloaded model (name str or a `rerankers.Reranker`). If
             None, the default ``answerai-colbert-small-v1`` is loaded + cached.
 
     Returns:
@@ -73,36 +84,24 @@ def colbert_rerank(query: str, candidates: list, top_k: int = 20, model=None):
         return []
 
     try:
-        if isinstance(model, str):
-            model = _load_model(model)
-        elif model is None:
-            model = _load_model(DEFAULT_COLBERT)
+        if isinstance(model, str) or model is None:
+            model = _load_model(model or DEFAULT_COLBERT)
 
         if model is None:
             return candidates[:top_k]  # graceful identity fallback
 
-        import torch
-
         texts = [_candidate_text(c) for c in candidates]
-        # pylate: encode query (is_query=True) and docs, then MaxSim score.
-        q_emb = model.encode([str(query)], is_query=True, convert_to_tensor=True)
-        d_emb = model.encode(texts, is_query=False, convert_to_tensor=True)
-
-        try:
-            from pylate import scores as pylate_scores  # type: ignore
-
-            sims = pylate_scores.colbert_scores(q_emb, d_emb)  # [1, n_docs]
-            scores = sims[0].tolist()
-        except Exception:
-            # Manual MaxSim: Σ_i max_j (q_i · d_j), per document.
-            qv = q_emb[0]  # [q_tokens, dim]
-            scores = []
-            for d in d_emb:  # d: [d_tokens, dim]
-                sim = qv @ d.T            # [q_tokens, d_tokens]
-                scores.append(float(sim.max(dim=1).values.sum()))
-
-        order = sorted(range(len(candidates)), key=lambda i: scores[i], reverse=True)
-        return [candidates[i] for i in order[:top_k]]
+        doc_ids = list(range(len(candidates)))
+        # rerankers: doc_ids are indices into `candidates`; results come back sorted.
+        ranked = model.rank(query=str(query), docs=texts, doc_ids=doc_ids)
+        results = getattr(ranked, "results", ranked)
+        order = [_result_index(r) for r in results]
+        # Keep only valid indices; backfill any dropped ones in original order.
+        seen = set()
+        out_idx = [i for i in order if 0 <= i < len(candidates) and not (i in seen or seen.add(i))]
+        if len(out_idx) < len(candidates):
+            out_idx += [i for i in doc_ids if i not in seen]
+        return [candidates[i] for i in out_idx[:top_k]]
     except Exception as exc:
         logger.warning("ColBERT rerank failed (%s) — identity fallback.", exc)
         return candidates[:top_k]

@@ -106,14 +106,13 @@ image = (
         # --- index/ablation/preflight stages (DANTE_BUILD_PLAN §4/§5) ---
         "rank-bm25==0.2.2",            # BM25 lexical leg (§4.1)
         "scipy==1.16.0",               # CSR sparse matmul for SPLADE scoring (R3)
-        # pylate = modern ST-native ColBERT for the reranker (§4.5). It is left
-        # UNPINNED here on purpose: if pip would force-downgrade the pinned
-        # torch/transformers above to satisfy pylate, the colbert_reranker's
-        # graceful identity-fallback keeps the ablation running, so the image must
-        # NOT break. If you see a downgrade in the build log, either pin a pylate
-        # release compatible with torch 2.12 / transformers 5.12 or drop this line
-        # and rely on the fallback (the "+ ColBERT" row then == the fused row).
-        "pylate",
+        # ColBERT reranker (§4.5) via AnswerDotAI's `rerankers` — purpose-built for
+        # answerai-colbert-small-v1 and dependency-light. We use this instead of
+        # pylate, which couples to sentence-transformers' internal API and broke on
+        # the pinned ST 5.6 (`generate_model_card` import error → reranker no-op).
+        # Left unpinned; the colbert_reranker keeps a graceful identity fallback so
+        # the ablation never crashes even if this leg fails to load.
+        "rerankers[transformers]",
     )
     .env({"HF_HOME": f"{ARTIFACTS}/hf", "TOKENIZERS_PARALLELISM": "false"})
     # Ship the dante/ source package so the index/ablation/preflight stages can
