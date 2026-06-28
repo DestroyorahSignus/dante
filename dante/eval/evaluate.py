@@ -141,6 +141,224 @@ def run_all_ablations(engine, queries: dict, qrels: dict,
     return {"results": results, "table": table, "n_queries": len(eval_q)}
 
 
+# ============================================================================
+# EVAL-ENRICHMENT (no retrain) — DANTE_BUILD_PLAN.md §4.2 / §14 (the D4 GPU pass)
+#
+#   (a) dim_truncation_ablation — robustness of the dense leg to embedding
+#       truncation. The bi-encoder is plain MNRL (NOT MatryoshkaLoss), so this is a
+#       "what does naive truncation cost?" ablation, not a Matryoshka claim: slice the
+#       768-d catalog embeddings to the first N dims, L2-RENORMALIZE, build a fresh
+#       IndexFlatIP, and measure dense recall@K + nDCG@10. The cheap-serving story.
+#   (b) rrf_k_sweep — re-fuse the SAME three legs' top-1000 lists at several RRF k
+#       values and report nDCG@10 + R@200 to justify k=60.
+#
+# Both reuse the shared evaluate_ranker + the SAME subsampled eval queries/seed as
+# run_all_ablations, so the rows are directly comparable to the baseline ablation.
+# ============================================================================
+
+def _format_dim_table(results: dict, ks=(10, 50, 100, 200)) -> str:
+    """Render the dim-truncation ablation as fixed-width text."""
+    rcols = [f"recall@{k}" for k in ks]
+    headers = ["Dense dim", "nDCG@10"] + [f"R@{k}" for k in ks]
+    rows = [headers]
+    for dim, m in results.items():
+        rows.append([
+            str(dim), f"{m.get('ndcg@10', 0):.4f}",
+            *[f"{m.get(c, 0):.4f}" for c in rcols],
+        ])
+    widths = [max(len(r[i]) for r in rows) for i in range(len(headers))]
+    out = []
+    for ri, row in enumerate(rows):
+        out.append("  ".join(cell.ljust(widths[i]) for i, cell in enumerate(row)))
+        if ri == 0:
+            out.append("  ".join("-" * widths[i] for i in range(len(headers))))
+    return "\n".join(out)
+
+
+def _format_rrf_table(results: dict) -> str:
+    """Render the RRF-k sweep as fixed-width text."""
+    headers = ["RRF k", "nDCG@10", "R@200"]
+    rows = [headers]
+    for k, m in results.items():
+        rows.append([str(k), f"{m.get('ndcg@10', 0):.4f}", f"{m.get('recall@200', 0):.4f}"])
+    widths = [max(len(r[i]) for r in rows) for i in range(len(headers))]
+    out = []
+    for ri, row in enumerate(rows):
+        out.append("  ".join(cell.ljust(widths[i]) for i, cell in enumerate(row)))
+        if ri == 0:
+            out.append("  ".join("-" * widths[i] for i in range(len(headers))))
+    return "\n".join(out)
+
+
+def dim_truncation_ablation(model, catalog_ids, catalog_texts, queries, qrels,
+                            dims=(768, 256, 128), ks=(10, 50, 100, 200),
+                            max_queries: int = 2000, seed: int = 42,
+                            encode_batch_size: int = 256, leg_top_k: int = 1000) -> dict:
+    """Dense-leg dimension-truncation robustness ablation (NO retrain).
+
+    Encodes the catalog AND the eval queries ONCE at full width, then for each target
+    ``dim`` slices the embeddings to the first ``dim`` columns, L2-renormalizes, builds
+    a fresh ``faiss.IndexFlatIP``, and scores dense-only retrieval through the shared
+    ``evaluate_ranker``. Truncate-THEN-renormalize is the documented cheap-index recipe
+    (§4.2 / §13 R5). The same subsampled eval queries (seed) as ``run_all_ablations``
+    are used, so the 768-d row reproduces the baseline "Dense" ablation row.
+
+    Args:
+        model: A loaded ``SentenceTransformer`` (the trained bi-encoder).
+        catalog_ids: Parallel product ids (full retrieval pool).
+        catalog_texts: Parallel product texts.
+        queries: ``{query_id: query_text}`` (full test set; subsampled inside).
+        qrels: graded ``{query_id: {product_id: grade}}``.
+        dims: Truncation widths to test (must be <= the model's full dim).
+        ks: Recall cutoffs.
+        max_queries: subsample cap (shared with the baseline ablation).
+        seed: subsample seed (shared with the baseline ablation).
+        encode_batch_size: catalog encode batch size.
+        leg_top_k: per-query retrieval depth (matches serving's leg_top_k).
+
+    Returns:
+        ``{"results": {dim: {metric: val}}, "table": str, "n_queries": int,
+           "full_dim": int}``.
+    """
+    import faiss
+    import numpy as np
+
+    eval_q = _subsample_queries(queries, qrels, max_queries, seed)
+    qids = list(eval_q)
+    print(f"[dim-ablation] evaluating {len(eval_q)} queries; dims={list(dims)}")
+
+    # Encode the catalog ONCE at full width (un-normalized — we renormalize per dim).
+    print(f"[dim-ablation] encoding catalog ({len(catalog_ids):,} products) once @ full dim ...")
+    cat_emb = model.encode(
+        list(catalog_texts), batch_size=encode_batch_size, show_progress_bar=True,
+        convert_to_numpy=True, normalize_embeddings=False,
+    ).astype("float32")
+    full_dim = int(cat_emb.shape[1])
+
+    # Encode the eval queries ONCE at full width too.
+    q_emb_full = model.encode(
+        [eval_q[qid] for qid in qids], batch_size=encode_batch_size,
+        show_progress_bar=False, convert_to_numpy=True, normalize_embeddings=False,
+    ).astype("float32")
+
+    k_search = min(leg_top_k, len(catalog_ids))
+    results: dict = {}
+    for dim in dims:
+        if dim > full_dim:
+            print(f"[dim-ablation] skip dim={dim} > model dim {full_dim}")
+            continue
+        # Slice to the first `dim` columns, then RENORMALIZE (truncate-then-normalize).
+        cat_d = np.ascontiguousarray(cat_emb[:, :dim]).astype("float32")
+        faiss.normalize_L2(cat_d)
+        index = faiss.IndexFlatIP(dim)
+        index.add(cat_d)
+
+        q_d = np.ascontiguousarray(q_emb_full[:, :dim]).astype("float32")
+        faiss.normalize_L2(q_d)
+        scores, idx = index.search(q_d, k_search)
+
+        # Precompute the per-query ranked id list (one batched FAISS search above),
+        # then route through the shared evaluate_ranker for identical metric code.
+        # Per-qid ranked lists from the one batched FAISS search above. We key by qid
+        # (not query text) to stay exact when two queries share text, then route
+        # through _evaluate_precomputed — the SAME metric code as evaluate_ranker.
+        ranked_by_qid = {
+            qids[row]: [catalog_ids[i] for i in idx[row] if i >= 0]
+            for row in range(len(qids))
+        }
+        metrics = _evaluate_precomputed(ranked_by_qid, eval_q, qrels, ks=ks)
+        results[dim] = metrics
+        print(f"[dim-ablation] dim={dim}: "
+              f"nDCG@10={metrics['ndcg@10']:.4f} R@200={metrics.get('recall@200', 0):.4f}")
+        del cat_d, index
+
+    table = _format_dim_table(results, ks=ks)
+    print("\n[dim-ablation]\n" + table + "\n")
+    return {"results": results, "table": table, "n_queries": len(eval_q),
+            "full_dim": full_dim}
+
+
+def _evaluate_precomputed(ranked_by_qid: dict, queries: dict, qrels: dict,
+                          ks=(10, 50, 100, 200)) -> dict:
+    """Like ``evaluate_ranker`` but takes already-ranked id lists keyed BY query id.
+
+    Used by the enrichment ablations, which batch their retrieval and so already have
+    per-qid ranked lists. Same metric code / same skip-if-no-positive rule as
+    ``evaluate_ranker`` → rows stay comparable.
+    """
+    ks = tuple(ks)
+    sums = {"mrr@10": 0.0, "ndcg@10": 0.0}
+    for k in ks:
+        sums[f"recall@{k}"] = 0.0
+    n = 0
+    for qid in queries:
+        rel_map = qrels.get(qid, {})
+        positives = {pid for pid, g in rel_map.items() if g >= POS_GRADE}
+        if not positives:
+            continue
+        ranked = ranked_by_qid.get(qid, [])
+        sums["mrr@10"] += reciprocal_rank(ranked[:10], positives)
+        sums["ndcg@10"] += ndcg_at_k(ranked, rel_map, 10)
+        for k in ks:
+            sums[f"recall@{k}"] += recall_at_k(ranked, positives, k)
+        n += 1
+    if n == 0:
+        return {m: 0.0 for m in sums}
+    return {m: v / n for m, v in sums.items()}
+
+
+def rrf_k_sweep(engine, queries, qrels, k_values=(10, 30, 60, 100),
+                legs=("dense", "bm25", "splade"), ks=(10, 50, 100, 200),
+                max_queries: int = 2000, seed: int = 42) -> dict:
+    """RRF constant sweep over the SAME three legs' top-1000 lists (NO retrain).
+
+    For each query the three legs' ranked lists are retrieved ONCE (cached), then
+    re-fused at every ``k`` in ``k_values`` via ``reciprocal_rank_fusion`` — so the
+    sweep costs one retrieval pass, not one per k. Reports nDCG@10 + R@200 to justify
+    the default ``k=60``. Same subsampled eval queries (seed) as ``run_all_ablations``.
+
+    Args:
+        engine: A constructed ``DanteSearchEngine`` (provides the per-leg helpers).
+        queries: ``{query_id: query_text}`` (full test set; subsampled inside).
+        qrels: graded judgements.
+        k_values: RRF k constants to sweep.
+        legs: which legs to fuse (default all three, matching production).
+        ks: recall cutoffs reported.
+        max_queries: subsample cap (shared with the baseline ablation).
+        seed: subsample seed (shared with the baseline ablation).
+
+    Returns:
+        ``{"results": {k: {metric: val}}, "table": str, "n_queries": int}``.
+    """
+    from ..models.fusion import reciprocal_rank_fusion
+
+    eval_q = _subsample_queries(queries, qrels, max_queries, seed)
+    print(f"[rrf-sweep] evaluating {len(eval_q)} queries; k_values={list(k_values)}")
+
+    leg_fns = {"dense": engine._dense, "bm25": engine._bm25, "splade": engine._splade}
+    top_n = max(ks)  # fuse deep enough for R@200
+
+    # Retrieve each leg ONCE per query and cache the ranked lists.
+    cached: dict = {}
+    for qid, qtext in eval_q.items():
+        cached[qid] = [leg_fns[leg](qtext, engine.leg_top_k) for leg in legs]
+
+    results: dict = {}
+    for k in k_values:
+        ranked_by_qid = {
+            qid: [pid for pid, _ in reciprocal_rank_fusion(lists, k=k, top_n=top_n)]
+            for qid, lists in cached.items()
+        }
+        metrics = _evaluate_precomputed(ranked_by_qid, eval_q, qrels, ks=ks)
+        results[k] = metrics
+        print(f"[rrf-sweep] k={k}: "
+              f"nDCG@10={metrics['ndcg@10']:.4f} R@200={metrics.get('recall@200', 0):.4f}")
+
+    table = _format_rrf_table(results)
+    print("\n[rrf-sweep]\n" + table + "\n")
+    return {"results": results, "table": table, "n_queries": len(eval_q)}
+
+
 def evaluate(engine, qrels, config):
     """Thin caller that loads queries from config and runs the full ablation (§5.2)."""
     serving = config.get("serving", {}) if isinstance(config, dict) else {}

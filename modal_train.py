@@ -498,15 +498,88 @@ def preflight(n: int = 2000):
     return report
 
 
+@app.function(image=image, volumes={ARTIFACTS: vol}, gpu="A100-80GB", timeout=2 * 60 * 60)
+def eval_enrich():
+    """Eval-enrichment (NO retrain): dim-truncation ablation + RRF-k sweep (§4.2 / §14).
+
+    Reuses the EXISTING trained bi-encoder + the catalog/qrels/queries on the volume.
+    Only the dense leg is rebuilt per truncation dim (slice → renormalize → IndexFlatIP);
+    the RRF sweep re-fuses the same cached leg lists at several k values.
+
+    (a) dim ablation — dims [768, 256, 128]: dense recall@{10,50,100,200} + nDCG@10.
+    (b) rrf sweep    — k in [10, 30, 60, 100]: nDCG@10 + R@200.
+
+    Uses the SAME eval.max_queries subsample + seed as run_ablation, so the 768-d dim
+    row and the k=60 sweep row line up with the baseline ablation. Writes
+    /artifacts/eval_enrich.json and prints two tables.
+    """
+    import json
+
+    import pandas as pd
+    from sentence_transformers import SentenceTransformer
+
+    from dante.eval.evaluate import dim_truncation_ablation, rrf_k_sweep
+    from dante.serving.search_engine import DanteSearchEngine
+
+    cfg = _default_config()
+    ks = tuple(cfg["eval"]["ks"])
+    max_queries = cfg["eval"]["max_queries"]
+    seed = cfg["eval"]["seed"]
+
+    with open(f"{ARTIFACTS}/data/qrels.json") as f:
+        qrels = json.load(f)
+    with open(f"{ARTIFACTS}/data/queries.json") as f:
+        queries = json.load(f)
+
+    # (a) Dimension-truncation ablation — needs only the trained encoder + catalog.
+    catalog = pd.read_parquet(cfg["serving"]["catalog_path"])
+    cat_ids = catalog["product_id"].astype(str).tolist()
+    cat_texts = catalog["product_text"].astype(str).tolist()
+    model = SentenceTransformer(cfg["biencoder"]["path"])
+    dim_out = dim_truncation_ablation(
+        model, cat_ids, cat_texts, queries, qrels,
+        dims=(768, 256, 128), ks=ks,
+        max_queries=max_queries, seed=seed,
+        leg_top_k=cfg["serving"]["leg_top_k"],
+    )
+
+    # (b) RRF-k sweep — reuse the full engine (loads the existing 3-leg indices).
+    engine = DanteSearchEngine(cfg)
+    rrf_out = rrf_k_sweep(
+        engine, queries, qrels,
+        k_values=(10, 30, 60, 100), legs=("dense", "bm25", "splade"),
+        ks=ks, max_queries=max_queries, seed=seed,
+    )
+
+    out = {
+        "dim_ablation": {
+            "results": dim_out["results"], "full_dim": dim_out["full_dim"],
+            "n_queries": dim_out["n_queries"],
+        },
+        "rrf_sweep": {
+            "results": rrf_out["results"], "n_queries": rrf_out["n_queries"],
+        },
+        "config": {"ks": list(ks), "max_queries": max_queries, "seed": seed},
+    }
+    out_path = f"{ARTIFACTS}/eval_enrich.json"
+    with open(out_path, "w") as f:
+        json.dump(out, f, indent=2)
+    vol.commit()
+    print(f"[eval_enrich] wrote {out_path}")
+    print("\n=== DIM-TRUNCATION ABLATION ===\n" + dim_out["table"])
+    print("\n=== RRF-k SWEEP ===\n" + rrf_out["table"])
+    return out
+
+
 @app.local_entrypoint()
 def main(stage: str = "all", epochs: int = 3, batch_size: int = 128, limit: int = 0):
     """Orchestrate the pipeline.
 
-    stage: 'all' | 'data' | 'train' | 'index' | 'ablation' | 'preflight'.
-    ('all' runs data + train; index/ablation/preflight are run explicitly so the
-     A100 index/eval passes don't fire on every smoke.)
+    stage: 'all' | 'data' | 'train' | 'index' | 'ablation' | 'preflight' | 'eval_enrich'.
+    ('all' runs data + train; index/ablation/preflight/eval_enrich are run explicitly
+     so the A100 index/eval passes don't fire on every smoke.)
     """
-    valid = ("all", "data", "train", "index", "ablation", "preflight")
+    valid = ("all", "data", "train", "index", "ablation", "preflight", "eval_enrich")
     if stage not in valid:
         raise SystemExit(f"unknown stage {stage!r}; use {'|'.join(valid)}")
     if stage in ("all", "data"):
@@ -524,3 +597,6 @@ def main(stage: str = "all", epochs: int = 3, batch_size: int = 128, limit: int 
     if stage == "preflight":
         print("== STAGE: preflight ==")
         print(preflight.remote())
+    if stage == "eval_enrich":
+        print("== STAGE: eval_enrich ==")
+        print(eval_enrich.remote())
