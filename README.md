@@ -21,15 +21,25 @@ ColBERT reranks the top-200 for the final ordering.
 
 ## Results (ablation)
 
+Amazon ESCI (US, reduced), 2,000 held-out test queries (query-disjoint split). Fine-tuned
+ModernBERT bi-encoder (3 epochs, MNRL in-batch negatives); SPLADE + ColBERT pretrained.
+Retriever ceiling (canonical-query recall@1 on the dense index) = **0.993**.
+
 | Configuration | MRR@10 | nDCG@10 | R@10 | R@100 | R@200 |
 |---|---|---|---|---|---|
-| BM25 only | | | | | |
-| Dense only (ModernBERT) | | | | | |
-| SPLADE only | | | | | |
-| Dense + BM25 (RRF) | | | | | |
-| Dense + SPLADE (RRF) | | | | | |
-| Dense + BM25 + SPLADE (RRF) | | | | | |
-| ↑ + ColBERT rerank | | | | | |
+| BM25 only | 0.542 | 0.321 | 0.192 | 0.457 | 0.530 |
+| Dense only (ModernBERT) | 0.531 | 0.313 | 0.196 | 0.527 | 0.627 |
+| SPLADE only | 0.659 | 0.434 | 0.267 | 0.594 | 0.674 |
+| Dense + BM25 (RRF) | 0.596 | 0.363 | 0.227 | 0.584 | 0.678 |
+| Dense + SPLADE (RRF) | 0.655 | 0.418 | 0.262 | 0.646 | **0.730** |
+| Dense + BM25 + SPLADE (RRF) | 0.660 | 0.424 | 0.265 | 0.637 | 0.719 |
+| **↑ + ColBERT rerank** | **0.679** | **0.448** | **0.276** | 0.630 | 0.719 |
+
+**Read:** fusion lifts recall (best R@200 = 0.730, Dense+SPLADE, vs 0.674 for the best single
+leg) and ColBERT reranking lifts ranking quality (+0.034 MRR@10 / +0.024 nDCG@10 over the fused
+top-200, recall unchanged since it only reorders). SPLADE is the strongest single signal; the
+in-batch-trained dense leg is the weakest — hard-negative mining (next iteration) is the lever to
+lift it. Full numbers in [`ablation_results.json`](ablation_results.json).
 
 ## Install
 
