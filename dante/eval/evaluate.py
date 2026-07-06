@@ -2,7 +2,7 @@
 
 One shared ``evaluate_ranker`` drives EVERY ablation row (and could drive the
 trainer's in-loop evaluator), so rows are always comparable — same metric code, same
-qrels. ``run_all_ablations`` runs the 10 configs through it and prints the §5.2 table.
+qrels. ``run_all_ablations`` runs the ablation configs through it and prints the §5.2 table.
 
 Conventions (§3.4 / §5):
   * qrels grades: Exact=3, Substitute=2, Complement=1, Irrelevant=0.
@@ -92,16 +92,17 @@ def _format_table(results: dict, ks=(10, 50, 100, 200)) -> str:
 def run_all_ablations(engine, queries: dict, qrels: dict,
                       ks=(10, 50, 100, 200), max_queries: int = 2000,
                       seed: int = 42) -> dict:
-    """Run the 10 ablation configs through the shared ``evaluate_ranker`` (§5.2).
+    """Run the ablation configs through the shared ``evaluate_ranker`` (§5.2).
 
     Configs: BM25, Dense, SPLADE, Dense+BM25, Dense+SPLADE, Dense+BM25+SPLADE,
-    Dense+BM25+SPLADE + ColBERT rerank, plus three v0.2 rows motivated by the
-    v0.1 measurements (Dense+SPLADE beat all-3 → BM25 adds noise; k=10-30 beat
-    k=60 on nDCG@10): "+ CE rerank (bge-reranker-base)" (a cross-encoder over the
-    SAME fused candidates as the ColBERT row), "Dense+SPLADE (RRF k=30)", and
-    "Dense+BM25+SPLADE (weighted RRF)" with BM25 down-weighted to 0.5. All
-    retrieval reuses ``engine``'s per-leg / fused helpers, so every row shares
-    production's retrieval code.
+    Dense+BM25+SPLADE + ColBERT rerank, plus v0.2 rows motivated by the v0.1
+    measurements (Dense+SPLADE beat all-3 → BM25 adds noise; k=10-30 beat k=60 on
+    nDCG@10): two cross-encoder rerank rows over the SAME fused candidates as the
+    ColBERT row — "+ CE rerank (gte-modernbert)" (Alibaba-NLP/gte-reranker-modernbert-base)
+    and "+ CE rerank (bge-v2-m3)" (BAAI/bge-reranker-v2-m3), both Apache-2.0 — then
+    "Dense+SPLADE (RRF k=30)" and "Dense+BM25+SPLADE (weighted RRF)" with BM25
+    down-weighted to 0.5. All retrieval reuses ``engine``'s per-leg / fused helpers,
+    so every row shares production's retrieval code.
 
     Args:
         engine: A constructed ``DanteSearchEngine``.
@@ -114,8 +115,15 @@ def run_all_ablations(engine, queries: dict, qrels: dict,
     Returns:
         ``{"results": {config: {metric: val}}, "table": str, "n_queries": int}``.
     """
-    from ..models.colbert_reranker import colbert_rerank, rerank
+    from ..models.colbert_reranker import ce_rerank, colbert_rerank
     from ..models.fusion import reciprocal_rank_fusion
+
+    # Cross-encoder rerankers compared over the SAME fused top-200 as the ColBERT row.
+    # Both Apache-2.0 and load in the `rerankers` lib on transformers 4.57.6:
+    #   * gte-reranker-modernbert-base — native ModernBERT seq-cls, BEIR 56.19 (best T4-fit).
+    #   * bge-reranker-v2-m3           — XLM-R seq-cls, the 2026 production default.
+    GTE_MODERNBERT = "Alibaba-NLP/gte-reranker-modernbert-base"
+    BGE_V2_M3 = "BAAI/bge-reranker-v2-m3"
 
     eval_q = _subsample_queries(queries, qrels, max_queries, seed)
     print(f"[ablation] evaluating {len(eval_q)} queries (of {len(queries)} test queries)")
@@ -127,14 +135,13 @@ def run_all_ablations(engine, queries: dict, qrels: dict,
                                   model=engine.colbert_model)
         return [c["product_id"] for c in reranked]
 
-    def _ce_rank(qtext):
+    def _ce_rank(qtext, model_id):
         # SAME fused candidates as the ColBERT row — only the reranker differs, so
-        # the two rows isolate late-interaction vs cross-encoder reranking.
+        # these rows isolate late-interaction vs cross-encoder reranking (and CE
+        # models against each other). ``ce_rerank`` runs model_type="cross-encoder".
         fused_ids = engine.fused(qtext, legs=("dense", "bm25", "splade"))
         candidates = [engine.product_db[p] for p in fused_ids if p in engine.product_db]
-        reranked = rerank(qtext, candidates, top_k=max(ks),
-                          model_name="BAAI/bge-reranker-base",
-                          model_type="cross-encoder")
+        reranked = ce_rerank(qtext, candidates, top_k=max(ks), model=model_id)
         return [c["product_id"] for c in reranked]
 
     def _fused_custom(qtext, legs, k=None, weights=None):
@@ -161,8 +168,10 @@ def run_all_ablations(engine, queries: dict, qrels: dict,
         "Dense+BM25+SPLADE":     lambda q: engine.fused(q, legs=("dense", "bm25", "splade")),
         "+ ColBERT rerank":      _colbert_rank,
         # --- v0.2 rows (v0.1-measured: BM25 noisy, k=10-30 > k=60) --------------
-        # Cross-encoder rerank of the SAME fused top-200 as the ColBERT row.
-        "+ CE rerank (bge-reranker-base)": _ce_rank,
+        # Cross-encoder reranks of the SAME fused top-200 as the ColBERT row — two
+        # stronger, Apache-2.0 CE models isolated against ColBERT and each other.
+        "+ CE rerank (gte-modernbert)": lambda q: _ce_rank(q, GTE_MODERNBERT),
+        "+ CE rerank (bge-v2-m3)":      lambda q: _ce_rank(q, BGE_V2_M3),
         # Best v0.1 pair, re-fused at the sweep's sweet-spot constant.
         "Dense+SPLADE (RRF k=30)":
             lambda q: _fused_custom(q, ("dense", "splade"), k=30),

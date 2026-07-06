@@ -17,6 +17,7 @@ import os
 
 from ..models.bm25 import BM25Index
 from ..models.biencoder import build_dense_index
+from ..models.splade import DEFAULT_MODEL as DEFAULT_SPLADE_MODEL
 from ..models.splade import SpladeEncoder
 
 
@@ -46,7 +47,7 @@ def build_indices(config) -> dict:
     catalog_path = _cfg(config, "serving", "catalog_path", default="/artifacts/data/catalog.parquet")
     index_dir = _cfg(config, "serving", "index_dir", default="/artifacts/index")
     biencoder_path = _cfg(config, "biencoder", "path", default="/artifacts/biencoder_final")
-    splade_model = _cfg(config, "splade", "model", default="naver/splade-cocondenser-ensembledistil")
+    splade_model = _cfg(config, "splade", "model", default=DEFAULT_SPLADE_MODEL)
     splade_maxlen = _cfg(config, "splade", "max_length", default=256)
 
     os.makedirs(index_dir, exist_ok=True)

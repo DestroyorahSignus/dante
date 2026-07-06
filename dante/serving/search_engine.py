@@ -17,6 +17,7 @@ from ..models.biencoder import dense_search
 from ..models.bm25 import BM25Index
 from ..models.colbert_reranker import colbert_rerank
 from ..models.fusion import reciprocal_rank_fusion
+from ..models.splade import DEFAULT_MODEL as DEFAULT_SPLADE_MODEL
 from ..models.splade import SpladeEncoder
 
 
@@ -43,7 +44,7 @@ class DanteSearchEngine:
         catalog_path = _cfg(config, "serving", "catalog_path",
                             default="/artifacts/data/catalog.parquet")
         biencoder_path = _cfg(config, "biencoder", "path", default="/artifacts/biencoder_final")
-        splade_model = _cfg(config, "splade", "model", default="naver/splade-cocondenser-ensembledistil")
+        splade_model = _cfg(config, "splade", "model", default=DEFAULT_SPLADE_MODEL)
         splade_maxlen = _cfg(config, "splade", "max_length", default=256)
 
         self.rrf_k = _cfg(config, "serving", "rrf_k", default=60)

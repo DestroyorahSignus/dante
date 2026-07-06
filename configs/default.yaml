@@ -16,9 +16,16 @@ biencoder:
   # Path to the trained SentenceTransformer (modal_train.py saves here on the volume).
   path: "/artifacts/biencoder_final"
 
-# Learned-sparse leg — pretrained SPLADE-v3 (Option A, 0h GPU; §4.3).
+# Learned-sparse leg — pretrained SPLADE encoder (Option A, 0h GPU; §4.3).
+# Model: opensearch-project/opensearch-neural-sparse-encoding-v2-distill.
+#   * License: Apache-2.0 (COMMERCIAL-friendly), ungated. Replaces the old
+#     naver/splade-cocondenser-ensembledistil, which is CC-BY-NC-SA (non-commercial)
+#     and unusable for a commercial portfolio.
+#   * Arch: DistilBertForMaskedLM (standard *ForMaskedLM) → the SPLADE
+#     max(log1p(relu(logits))*mask) aggregation in SpladeEncoder applies unchanged.
+#   * Quality: BEIR avg nDCG@10 ~0.528 (>= the old cocondenser distil).
 splade:
-  model: "naver/splade-cocondenser-ensembledistil"
+  model: "opensearch-project/opensearch-neural-sparse-encoding-v2-distill"
   max_length: 256
 
 # Lexical leg — BM25 over the catalog (§4.1).

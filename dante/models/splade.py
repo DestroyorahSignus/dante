@@ -4,15 +4,29 @@
 SPLADE aggregation (``max`` over sequence of ``log1p(relu(logits))``). The catalog
 index stores all doc vectors as ONE ``scipy.sparse`` CSR matrix and scores a query
 with a single sparse matmul ``q @ doc_matrix.T`` (RISK R3) — never a per-doc Python
-loop. ``naver/splade-cocondenser-ensembledistil`` is used pretrained (0h GPU, plan default).
+loop.
+
+Model choice (``DEFAULT_MODEL``): ``opensearch-project/opensearch-neural-sparse-encoding-v2-distill``.
+  * License: Apache-2.0 (COMMERCIAL-friendly), ungated — replaces the previous
+    ``naver/splade-cocondenser-ensembledistil`` (CC-BY-NC-SA, non-commercial), which
+    is unusable for a commercial portfolio.
+  * Architecture: ``DistilBertForMaskedLM`` (a standard ``*ForMaskedLM``), so it loads
+    via ``AutoModelForMaskedLM`` and the SPLADE ``max(log1p(relu(logits))*mask)``
+    aggregation below applies UNCHANGED (verified against its config.json).
+  * Quality: BEIR avg nDCG@10 ~0.528.
+The model id is config-driven (``splade.model`` in configs/default.yaml); this default
+is only the fallback when no config value is supplied.
 """
 from __future__ import annotations
+
+# Apache-2.0, ungated, DistilBertForMaskedLM, BEIR ~0.528. See module docstring.
+DEFAULT_MODEL = "opensearch-project/opensearch-neural-sparse-encoding-v2-distill"
 
 
 class SpladeEncoder:
     """Encode text into a sparse SPLADE vector and run CSR-matmul catalog search."""
 
-    def __init__(self, model_name: str = "naver/splade-cocondenser-ensembledistil", device: str | None = None,
+    def __init__(self, model_name: str = DEFAULT_MODEL, device: str | None = None,
                  max_length: int = 256) -> None:
         from transformers import AutoModelForMaskedLM, AutoTokenizer
 

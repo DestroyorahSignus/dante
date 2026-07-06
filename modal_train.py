@@ -507,7 +507,7 @@ def _default_config(model_dir: str = "biencoder_final", index_dir: str = "index"
                     results_name: str = "ablation_results.json") -> dict:
     return {
         "biencoder": {"path": f"{ARTIFACTS}/{model_dir}"},
-        "splade": {"model": "naver/splade-cocondenser-ensembledistil", "max_length": 256},
+        "splade": {"model": "opensearch-project/opensearch-neural-sparse-encoding-v2-distill", "max_length": 256},
         "colbert": {"model": "answerdotai/answerai-colbert-small-v1"},
         "serving": {
             "catalog_path": f"{ARTIFACTS}/data/catalog.parquet",

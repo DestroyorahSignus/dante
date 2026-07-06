@@ -11,7 +11,8 @@ pytest.importorskip("transformers")
 pytest.importorskip("scipy")
 pytest.importorskip("torch")
 
-SPLADE_MODEL = "naver/splade-cocondenser-ensembledistil"
+# Apache-2.0 SPLADE (see dante.models.splade.DEFAULT_MODEL); commercial-friendly.
+SPLADE_MODEL = "opensearch-project/opensearch-neural-sparse-encoding-v2-distill"
 
 
 @pytest.fixture(scope="module")
