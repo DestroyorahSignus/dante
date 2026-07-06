@@ -129,9 +129,9 @@ WARMUP_RATIO = 0.1
 
 # ESCI is hosted on HuggingFace; we build (anchor=query, positive=product_text)
 # pairs and train with MultipleNegativesRankingLoss using in-batch negatives.
-# (Explicit BM25 hard negatives are a documented phase-2 enhancement — brute-force
-#  rank_bm25 over the full catalog is too slow to ship as the default; see
-#  DANTE_BUILD_PLAN.md §4.2 and the "common pitfalls" note about brute-force.)
+# (v0.2: the `mine` stage adds DENSE hard negatives per §4.2 — batched FAISS via
+#  sentence_transformers.util.mine_hard_negatives, never brute-force rank_bm25 —
+#  writing data/train_hn n-tuples that MNRL consumes natively via --train_dir.)
 ESCI_DATASET = "tasksource/esci"
 
 # Graded relevance (§3.4) — labels are full WORDS on this mirror, not E/S/C/I.
@@ -300,10 +300,29 @@ def prepare_data(limit: int = 0, max_pos_per_query: int = 16, val_frac: float = 
     # company Mongo secret. Runs log to the WANDB_PROJECT set below.
     secrets=[modal.Secret.from_name("dante-wandb")],
 )
-def train_biencoder(epochs: int = 3, batch_size: int = 128):
-    """Fine-tune ModernBERT on the prepared pairs with MNRL. Save to the volume.
+def train_biencoder(epochs: int = 3, batch_size: int = 128,
+                    train_dir: str = "data/train",
+                    output_name: str = "biencoder_final",
+                    base_model: str = MODEL_NAME):
+    """Fine-tune a base encoder on the prepared pairs with MNRL. Save to the volume.
 
-    Output: ``{ARTIFACTS}/biencoder_final`` (a SentenceTransformer you can load
+    Args:
+        epochs / batch_size: standard hyperparameters (configs/default.yaml).
+        base_model: HF checkpoint to fine-tune. Default ``answerdotai/ModernBERT-base``
+            (v0.1 baseline). The §4.2 fallback ``BAAI/bge-base-en-v1.5`` also works —
+            bge models encode raw text fine without instruction prefixes for this
+            symmetric-ish product-search setup, so no prompt plumbing is needed.
+        train_dir: volume-relative training dataset dir. Default ``data/train``
+            = the v0.1 (anchor, positive) pairs (baseline reproducible). Pass
+            ``data/train_hn`` to train on the mined hard-negative n-tuples —
+            MNRL in ST 4.x natively treats every column after (anchor, positive),
+            i.e. negative_1..negative_n, as explicit hard negatives on top of the
+            in-batch ones.
+        output_name: volume-relative output dir for the final model. Default
+            ``biencoder_final`` (v0.1 path); pass e.g. ``biencoder_v2`` so a
+            hard-negative run never clobbers the v0.1 weights.
+
+    Output: ``{ARTIFACTS}/{output_name}`` (a SentenceTransformer you can load
     with ``SentenceTransformer(path)``).
     """
     import os
@@ -319,22 +338,29 @@ def train_biencoder(epochs: int = 3, batch_size: int = 128):
     # (company entity, but kept under its own project so portfolio runs are separable).
     os.environ.setdefault("WANDB_PROJECT", "dante-portfolio")
 
-    train_path, val_path = f"{ARTIFACTS}/data/train", f"{ARTIFACTS}/data/val"
+    train_path, val_path = f"{ARTIFACTS}/{train_dir}", f"{ARTIFACTS}/data/val"
     if not os.path.isdir(train_path):
-        raise RuntimeError("No prepared data found — run `--stage data` first.")
+        raise RuntimeError(f"No prepared data found at {train_path} — run "
+                           "`--stage data` (and `--stage mine` for train_hn) first.")
 
     train_ds = load_from_disk(train_path)
     val_ds = load_from_disk(val_path)
-    print(f"[train] train={len(train_ds):,}  val={len(val_ds):,}  bs={batch_size}  epochs={epochs}")
+    print(f"[train] train={len(train_ds):,} ({train_dir})  val={len(val_ds):,}  "
+          f"bs={batch_size}  epochs={epochs}  base={base_model}  -> {output_name}")
+    print(f"[train] train columns: {train_ds.column_names}")
 
     # sdpa attention avoids the optional flash-attn build; mean pooling by default.
-    model = SentenceTransformer(MODEL_NAME, model_kwargs={"attn_implementation": "sdpa"})
+    model = SentenceTransformer(base_model, model_kwargs={"attn_implementation": "sdpa"})
     model.max_seq_length = MAX_SEQ_LENGTH
 
     loss = MultipleNegativesRankingLoss(model)
 
+    # Keep the historical ckpt dir for the default run (baseline reproducible);
+    # non-default output names get their own ckpt dir so runs never mix.
+    ckpt_dir = (f"{ARTIFACTS}/biencoder_ckpts" if output_name == "biencoder_final"
+                else f"{ARTIFACTS}/{output_name}_ckpts")
     args = SentenceTransformerTrainingArguments(
-        output_dir=f"{ARTIFACTS}/biencoder_ckpts",
+        output_dir=ckpt_dir,
         num_train_epochs=epochs,
         per_device_train_batch_size=batch_size,
         learning_rate=LEARNING_RATE,
@@ -352,7 +378,8 @@ def train_biencoder(epochs: int = 3, batch_size: int = 128):
         logging_steps=50,
         dataloader_num_workers=4,
         report_to=["wandb"],  # log to W&B (dante-portfolio); key via dante-wandb secret
-        run_name=f"dante-biencoder-e{epochs}-bs{batch_size}",
+        run_name=(f"dante-biencoder-e{epochs}-bs{batch_size}"
+                  + ("" if output_name == "biencoder_final" else f"-{output_name}")),
     )
 
     trainer = SentenceTransformerTrainer(
@@ -360,53 +387,153 @@ def train_biencoder(epochs: int = 3, batch_size: int = 128):
     )
     trainer.train()
 
-    out = f"{ARTIFACTS}/biencoder_final"
+    out = f"{ARTIFACTS}/{output_name}"
     model.save_pretrained(out)
     vol.commit()
     print(f"[train] DONE — model saved to volume at {out}")
-    print("[train] pull it with:  modal volume get dante-artifacts /biencoder_final ./models/dante_biencoder")
+    print(f"[train] pull it with:  modal volume get dante-artifacts /{output_name} ./models/dante_biencoder")
     return out
+
+
+@app.function(image=image, volumes={ARTIFACTS: vol}, gpu="A100-80GB", timeout=2 * 60 * 60)
+def mine(num_negatives: int = 4, range_min: int = 1, range_max: int = 100,
+         batch_size: int = 1024):
+    """Mine DENSE hard negatives with the v0.1 bi-encoder (BUILD_PLAN §4.2, dense-first).
+
+    Motivation (v0.1 ablation, 2,000 test queries): the Dense leg is the WEAKEST
+    (R@200 0.627) because it was trained with in-batch negatives only. This stage
+    mines semantically-confusable negatives from the FULL catalog with the trained
+    v0.1 model — the batched-FAISS path §4.2 mandates (never brute-force rank_bm25).
+
+    Reads : {ARTIFACTS}/biencoder_final, {ARTIFACTS}/data/train (anchor/positive),
+            {ARTIFACTS}/data/catalog.parquet (full 351,961-product corpus).
+    Writes: {ARTIFACTS}/data/train_hn — HF dataset with columns
+            anchor, positive, negative_1..negative_{num_negatives}
+            (output_format="n-tuple"; MNRL consumes the extra columns natively).
+            {ARTIFACTS}/data/train is NOT touched (v0.1 stays reproducible).
+
+    False-negative guards (§4.2 / RISKS R8 — do not mine unlabeled positives):
+      * mine_hard_negatives itself never returns a row's OWN positive.
+      * A query's OTHER labeled positives sit in the corpus too — we do not
+        blocklist them explicitly; instead range_min=1 skips the top hit and the
+        zero margin (absolute_margin/margin=0.0) drops any candidate scoring >=
+        the row's positive, which is exactly the §4.2 recipe for keeping likely
+        (unlabeled or other-labeled) positives out of the negative set.
+    """
+    import inspect
+    import os
+
+    import pandas as pd
+    from datasets import load_from_disk
+    from sentence_transformers import SentenceTransformer
+    from sentence_transformers.util import mine_hard_negatives
+
+    train_path = f"{ARTIFACTS}/data/train"
+    catalog_path = f"{ARTIFACTS}/data/catalog.parquet"
+    model_path = f"{ARTIFACTS}/biencoder_final"
+    for p in (train_path, catalog_path, model_path):
+        if not os.path.exists(p):
+            raise RuntimeError(f"Missing volume artifact {p} — run data/train stages first.")
+
+    train_ds = load_from_disk(train_path)
+    catalog = pd.read_parquet(catalog_path)
+    corpus_texts = catalog["product_text"].astype(str).tolist()
+    model = SentenceTransformer(model_path, model_kwargs={"attn_implementation": "sdpa"})
+    print(f"[mine] pairs={len(train_ds):,}  corpus={len(corpus_texts):,}  "
+          f"num_negatives={num_negatives}  range=[{range_min},{range_max}]")
+
+    # Build kwargs defensively: ST versions rename things (margin -> absolute_margin/
+    # relative_margin in 4.x; corpus= exists in 4.1.0). Inspect the runtime signature
+    # and pass only what it supports, printing anything we had to drop.
+    supported = set(inspect.signature(mine_hard_negatives).parameters)
+    kwargs = {
+        # negatives come from the WHOLE catalog, not just the positives' texts
+        "corpus": corpus_texts,
+        "num_negatives": num_negatives,
+        "range_min": range_min,     # skip the top hit (likely an unlabeled positive)
+        "range_max": range_max,     # mine within ranks [range_min, range_max]
+        "sampling_strategy": "random",  # random within the range → diversity (§4.2)
+        "batch_size": batch_size,   # A100-80GB encode batch
+        "output_format": "n-tuple",  # anchor, positive, negative_1..n → MNRL-native
+        "use_faiss": True,          # batched ANN — the whole point of §4.2
+        "verbose": True,
+    }
+    # margin guard, whatever this ST version calls it (candidate sim must be
+    # strictly below the positive's sim).
+    if "absolute_margin" in supported:
+        kwargs["absolute_margin"] = 0.0
+    elif "margin" in supported:
+        kwargs["margin"] = 0.0
+    else:
+        print("[mine] NOTE: no margin kwarg in this ST version — relying on range_min only")
+    if "corpus" not in supported:
+        # Fallback: mine within the positives' texts only (weaker corpus; §4.2 note).
+        print("[mine] NOTE: this ST version's mine_hard_negatives has no corpus= — "
+              "falling back to mining within the training positives only")
+    dropped = sorted(set(kwargs) - supported)
+    if dropped:
+        print(f"[mine] NOTE: dropping unsupported kwargs for this ST version: {dropped}")
+    kwargs = {k: v for k, v in kwargs.items() if k in supported}
+    print(f"[mine] mine_hard_negatives kwargs: "
+          f"{ {k: (f'<{len(v):,} texts>' if k == 'corpus' else v) for k, v in kwargs.items()} }")
+
+    mined = mine_hard_negatives(train_ds, model, **kwargs)
+
+    neg_cols = [c for c in mined.column_names if c.startswith("negative")]
+    out = f"{ARTIFACTS}/data/train_hn"
+    mined.save_to_disk(out)
+    vol.commit()
+    stats = {"rows": len(mined), "columns": mined.column_names,
+             "negatives_per_row": len(neg_cols),
+             "input_pairs": len(train_ds)}
+    print(f"[mine] DONE — saved {out}  {stats}")
+    return stats
 
 
 # A default config that mirrors configs/default.yaml but points at the volume.
 # (The package code reads nested dicts, so this is passed straight through.)
-def _default_config() -> dict:
+# model_dir / index_dir / results_name are volume-relative overrides so v0.2 runs
+# (e.g. biencoder_v2 + index_v2 + ablation_results_v2.json) never clobber v0.1.
+def _default_config(model_dir: str = "biencoder_final", index_dir: str = "index",
+                    results_name: str = "ablation_results.json") -> dict:
     return {
-        "biencoder": {"path": f"{ARTIFACTS}/biencoder_final"},
+        "biencoder": {"path": f"{ARTIFACTS}/{model_dir}"},
         "splade": {"model": "naver/splade-cocondenser-ensembledistil", "max_length": 256},
         "colbert": {"model": "answerdotai/answerai-colbert-small-v1"},
         "serving": {
             "catalog_path": f"{ARTIFACTS}/data/catalog.parquet",
-            "index_dir": f"{ARTIFACTS}/index",
+            "index_dir": f"{ARTIFACTS}/{index_dir}",
             "queries_path": f"{ARTIFACTS}/data/queries.json",
             "rrf_k": 60, "top_n": 200, "leg_top_k": 1000,
         },
         "eval": {"ks": [10, 50, 100, 200], "max_queries": 2000, "seed": 42,
-                 "results_path": f"{ARTIFACTS}/ablation_results.json",
+                 "results_path": f"{ARTIFACTS}/{results_name}",
                  "queries_path": f"{ARTIFACTS}/data/queries.json"},
     }
 
 
 @app.function(image=image, volumes={ARTIFACTS: vol}, gpu="A100-80GB", timeout=2 * 60 * 60)
-def build_index():
-    """Build dense FAISS + BM25 + SPLADE-CSR indices → ``/artifacts/index/`` (§4.6)."""
+def build_index(model_dir: str = "biencoder_final", index_dir: str = "index"):
+    """Build dense FAISS + BM25 + SPLADE-CSR indices → ``{ARTIFACTS}/{index_dir}/`` (§4.6)."""
     from dante.serving.index_builder import build_indices
 
-    paths = build_indices(_default_config())
+    paths = build_indices(_default_config(model_dir=model_dir, index_dir=index_dir))
     vol.commit()
     print(f"[index] committed: {paths}")
     return paths
 
 
 @app.function(image=image, volumes={ARTIFACTS: vol}, gpu="A100-80GB", timeout=4 * 60 * 60)
-def run_ablation():
-    """Load the index + qrels + queries → run the 7-config ablation (§5.2)."""
+def run_ablation(model_dir: str = "biencoder_final", index_dir: str = "index",
+                 results_name: str = "ablation_results.json"):
+    """Load the index + qrels + queries → run the 10-config ablation (§5.2)."""
     import json
 
     from dante.eval.evaluate import run_all_ablations
     from dante.serving.search_engine import DanteSearchEngine
 
-    cfg = _default_config()
+    cfg = _default_config(model_dir=model_dir, index_dir=index_dir,
+                          results_name=results_name)
     with open(f"{ARTIFACTS}/data/qrels.json") as f:
         qrels = json.load(f)
     with open(f"{ARTIFACTS}/data/queries.json") as f:
@@ -427,7 +554,7 @@ def run_ablation():
 
 
 @app.function(image=image, volumes={ARTIFACTS: vol}, gpu="A100-80GB", timeout=60 * 60)
-def preflight(n: int = 2000):
+def preflight(n: int = 2000, model_dir: str = "biencoder_final", index_dir: str = "index"):
     """GPU sanity on the volume artifacts BEFORE trusting real-query numbers.
 
     1. FAISS self-test: encode N catalog docs, query with a doc's own text → expect
@@ -447,7 +574,7 @@ def preflight(n: int = 2000):
     from dante.models.biencoder import build_dense_index, dense_search
     from dante.models.splade import SpladeEncoder, visualize_expansion
 
-    cfg = _default_config()
+    cfg = _default_config(model_dir=model_dir, index_dir=index_dir)
     catalog = pd.read_parquet(cfg["serving"]["catalog_path"])
     ids = catalog["product_id"].astype(str).tolist()
     texts = catalog["product_text"].astype(str).tolist()
@@ -572,14 +699,29 @@ def eval_enrich():
 
 
 @app.local_entrypoint()
-def main(stage: str = "all", epochs: int = 3, batch_size: int = 128, limit: int = 0):
+def main(stage: str = "all", epochs: int = 3, batch_size: int = 128, limit: int = 0,
+         train_dir: str = "data/train", output_name: str = "biencoder_final",
+         base_model: str = MODEL_NAME,
+         model_dir: str = "biencoder_final", index_dir: str = "index",
+         results_name: str = "ablation_results.json", num_negatives: int = 4):
     """Orchestrate the pipeline.
 
-    stage: 'all' | 'data' | 'train' | 'index' | 'ablation' | 'preflight' | 'eval_enrich'.
-    ('all' runs data + train; index/ablation/preflight/eval_enrich are run explicitly
-     so the A100 index/eval passes don't fire on every smoke.)
+    stage: 'all' | 'data' | 'train' | 'mine' | 'index' | 'ablation' | 'preflight'
+           | 'eval_enrich'.
+    ('all' runs data + train; mine/index/ablation/preflight/eval_enrich are run
+     explicitly so the A100 index/eval passes don't fire on every smoke.)
+
+    v0.2 hard-negative flow (defaults keep v0.1 fully reproducible):
+        modal run modal_train.py --stage mine
+        modal run modal_train.py --stage train --train-dir data/train_hn --output-name biencoder_v2 --batch-size 64
+        # parallel retrain candidate on the §4.2 fallback base:
+        modal run modal_train.py --stage train --train-dir data/train_hn --output-name biencoder_v2_bge --base-model BAAI/bge-base-en-v1.5 --batch-size 64
+        modal run modal_train.py --stage index --model-dir biencoder_v2 --index-dir index_v2
+        modal run modal_train.py --stage preflight --model-dir biencoder_v2 --index-dir index_v2
+        modal run modal_train.py --stage ablation --model-dir biencoder_v2 --index-dir index_v2 --results-name ablation_results_v2.json
     """
-    valid = ("all", "data", "train", "index", "ablation", "preflight", "eval_enrich")
+    valid = ("all", "data", "train", "mine", "index", "ablation", "preflight",
+             "eval_enrich")
     if stage not in valid:
         raise SystemExit(f"unknown stage {stage!r}; use {'|'.join(valid)}")
     if stage in ("all", "data"):
@@ -587,16 +729,22 @@ def main(stage: str = "all", epochs: int = 3, batch_size: int = 128, limit: int 
         print(prepare_data.remote(limit=limit))
     if stage in ("all", "train"):
         print("== STAGE: train_biencoder ==")
-        print(train_biencoder.remote(epochs=epochs, batch_size=batch_size))
+        print(train_biencoder.remote(epochs=epochs, batch_size=batch_size,
+                                     train_dir=train_dir, output_name=output_name,
+                                     base_model=base_model))
+    if stage == "mine":
+        print("== STAGE: mine (dense hard negatives) ==")
+        print(mine.remote(num_negatives=num_negatives))
     if stage == "index":
         print("== STAGE: build_index ==")
-        print(build_index.remote())
+        print(build_index.remote(model_dir=model_dir, index_dir=index_dir))
     if stage == "ablation":
         print("== STAGE: run_ablation ==")
-        print(run_ablation.remote())
+        print(run_ablation.remote(model_dir=model_dir, index_dir=index_dir,
+                                  results_name=results_name))
     if stage == "preflight":
         print("== STAGE: preflight ==")
-        print(preflight.remote())
+        print(preflight.remote(model_dir=model_dir, index_dir=index_dir))
     if stage == "eval_enrich":
         print("== STAGE: eval_enrich ==")
         print(eval_enrich.remote())
