@@ -396,8 +396,8 @@ def train_biencoder(epochs: int = 3, batch_size: int = 128,
 
 
 @app.function(image=image, volumes={ARTIFACTS: vol}, gpu="A100-80GB", timeout=2 * 60 * 60)
-def mine(num_negatives: int = 4, range_min: int = 1, range_max: int = 100,
-         batch_size: int = 1024):
+def mine(num_negatives: int = 4, range_min: int = 1, range_max: int = 200,
+         batch_size: int = 1024, output_format: str = "triplet"):
     """Mine DENSE hard negatives with the v0.1 bi-encoder (BUILD_PLAN §4.2, dense-first).
 
     Motivation (v0.1 ablation, 2,000 test queries): the Dense leg is the WEAKEST
@@ -454,7 +454,11 @@ def mine(num_negatives: int = 4, range_min: int = 1, range_max: int = 100,
         "range_max": range_max,     # mine within ranks [range_min, range_max]
         "sampling_strategy": "random",  # random within the range → diversity (§4.2)
         "batch_size": batch_size,   # A100-80GB encode batch
-        "output_format": "n-tuple",  # anchor, positive, negative_1..n → MNRL-native
+        # "triplet" (default) emits one (anchor, positive, negative) ROW per mined
+        # negative → keeps every anchor that yields >=1 negative (n-tuple DROPS any
+        # anchor that can't fill all num_negatives slots — that cost us 83% of rows
+        # in the first pass: 41,213/244,179). MNRL consumes triplets natively.
+        "output_format": output_format,
         "use_faiss": True,          # batched ANN — the whole point of §4.2
         "verbose": True,
     }
@@ -712,7 +716,8 @@ def main(stage: str = "all", epochs: int = 3, batch_size: int = 128, limit: int 
          train_dir: str = "data/train", output_name: str = "biencoder_final",
          base_model: str = MODEL_NAME,
          model_dir: str = "biencoder_final", index_dir: str = "index",
-         results_name: str = "ablation_results.json", num_negatives: int = 4):
+         results_name: str = "ablation_results.json", num_negatives: int = 4,
+         mine_range_max: int = 200, mine_output_format: str = "triplet"):
     """Orchestrate the pipeline.
 
     stage: 'all' | 'data' | 'train' | 'mine' | 'index' | 'ablation' | 'preflight'
@@ -743,7 +748,8 @@ def main(stage: str = "all", epochs: int = 3, batch_size: int = 128, limit: int 
                                      base_model=base_model))
     if stage == "mine":
         print("== STAGE: mine (dense hard negatives) ==")
-        print(mine.remote(num_negatives=num_negatives))
+        print(mine.remote(num_negatives=num_negatives, range_max=mine_range_max,
+                          output_format=mine_output_format))
     if stage == "index":
         print("== STAGE: build_index ==")
         print(build_index.remote(model_dir=model_dir, index_dir=index_dir))
