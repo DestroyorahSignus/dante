@@ -332,7 +332,12 @@ def train_biencoder(epochs: int = 3, batch_size: int = 128,
         SentenceTransformerTrainer,
         SentenceTransformerTrainingArguments,
     )
-    from sentence_transformers.losses import MultipleNegativesRankingLoss
+    from sentence_transformers.losses import (
+        CachedMultipleNegativesRankingLoss,
+        MultipleNegativesRankingLoss,
+    )
+    from sentence_transformers.training_args import BatchSamplers
+    from sentence_transformers.evaluation import InformationRetrievalEvaluator
 
     # W&B: the dante-wandb secret provides WANDB_API_KEY; log to a namespaced project
     # (company entity, but kept under its own project so portfolio runs are separable).
@@ -353,7 +358,39 @@ def train_biencoder(epochs: int = 3, batch_size: int = 128,
     model = SentenceTransformer(base_model, model_kwargs={"attn_implementation": "sdpa"})
     model.max_seq_length = MAX_SEQ_LENGTH
 
-    loss = MultipleNegativesRankingLoss(model)
+    # CachedMNRL (GradCache): decouples the effective (in-batch-negative) batch size
+    # from GPU memory by chunking the encode into mini-batches with gradient caching.
+    # In-batch negatives are the dominant MNRL quality lever, so we push the effective
+    # batch to `batch_size` (e.g. 2048) while only ever materializing MINI_BATCH rows of
+    # activations at once — far more negatives/step than plain MNRL at bs=256 (Challenger
+    # C3). Falls back to plain MNRL if the effective batch is small (nothing to cache).
+    MINI_BATCH = 256
+    if batch_size > MINI_BATCH:
+        loss = CachedMultipleNegativesRankingLoss(model, mini_batch_size=MINI_BATCH)
+        print(f"[train] loss=CachedMNRL (effective bs={batch_size}, mini_batch={MINI_BATCH})")
+    else:
+        loss = MultipleNegativesRankingLoss(model)
+        print(f"[train] loss=MNRL (bs={batch_size})")
+
+    # Retrieval evaluator for best-checkpoint selection (BUILD_PLAN §4.2 gotcha, Challenger
+    # C4b): a small fast IR eval over the query-disjoint val holdout. Corpus = the val
+    # positives (a cheap proxy catalog — the FULL-catalog recall is measured later by the
+    # ablation). load_best_model_at_end selects on eval_loss (always present → robust) while
+    # this surfaces nDCG@10/recall@10 in the logs to catch hard-negative overfit.
+    val_cap = min(len(val_ds), 2000)
+    _vq = val_ds[:val_cap]
+    ir_queries, ir_corpus, ir_rel, _pos2cid = {}, {}, {}, {}
+    for _i, (_a, _p) in enumerate(zip(_vq["anchor"], _vq["positive"])):
+        _cid = _pos2cid.get(_p)
+        if _cid is None:
+            _cid = f"d{len(_pos2cid)}"; _pos2cid[_p] = _cid; ir_corpus[_cid] = _p
+        _qid = f"q{_i}"; ir_queries[_qid] = _a; ir_rel[_qid] = {_cid}
+    ir_eval = InformationRetrievalEvaluator(
+        ir_queries, ir_corpus, ir_rel, name="val",
+        ndcg_at_k=[10], accuracy_at_k=[1, 10], precision_recall_at_k=[10],
+        map_at_k=[10], show_progress_bar=False,
+    )
+    print(f"[train] IR eval: {len(ir_queries)} queries / {len(ir_corpus)} corpus docs")
 
     # Keep the historical ckpt dir for the default run (baseline reproducible);
     # non-default output names get their own ckpt dir so runs never mix.
@@ -367,15 +404,22 @@ def train_biencoder(epochs: int = 3, batch_size: int = 128,
         warmup_ratio=WARMUP_RATIO,
         lr_scheduler_type="cosine",
         bf16=True,
-        # A100-80GB has ample headroom for a 150M model at bs=128/seq=256, so
-        # gradient checkpointing is off for speed. Flip to True if you ever OOM.
         gradient_checkpointing=False,
+        # NO_DUPLICATES: triplet mining emits one row per negative, so the same
+        # (anchor, positive) repeats up to num_negatives times. Without this sampler two
+        # such rows can co-occur in a batch and MNRL would push an anchor away from its
+        # OWN positive (in-batch false negative) — exactly the weak dense leg we're lifting
+        # (Challenger C1). NO_DUPLICATES guarantees no repeated text within a batch.
+        batch_sampler=BatchSamplers.NO_DUPLICATES,
         eval_strategy="steps",
-        eval_steps=500,
+        eval_steps=25,
         save_strategy="steps",
-        save_steps=500,
+        save_steps=25,
         save_total_limit=2,
-        logging_steps=50,
+        load_best_model_at_end=True,
+        metric_for_best_model="eval_loss",
+        greater_is_better=False,
+        logging_steps=10,
         dataloader_num_workers=4,
         report_to=["wandb"],  # log to W&B (dante-portfolio); key via dante-wandb secret
         run_name=(f"dante-biencoder-e{epochs}-bs{batch_size}"
@@ -384,6 +428,7 @@ def train_biencoder(epochs: int = 3, batch_size: int = 128,
 
     trainer = SentenceTransformerTrainer(
         model=model, args=args, train_dataset=train_ds, eval_dataset=val_ds, loss=loss,
+        evaluator=ir_eval,
     )
     trainer.train()
 
@@ -396,7 +441,7 @@ def train_biencoder(epochs: int = 3, batch_size: int = 128,
 
 
 @app.function(image=image, volumes={ARTIFACTS: vol}, gpu="A100-80GB", timeout=2 * 60 * 60)
-def mine(num_negatives: int = 4, range_min: int = 1, range_max: int = 200,
+def mine(num_negatives: int = 4, range_min: int = 10, range_max: int = 200,
          batch_size: int = 1024, output_format: str = "triplet"):
     """Mine DENSE hard negatives with the v0.1 bi-encoder (BUILD_PLAN §4.2, dense-first).
 
@@ -414,11 +459,12 @@ def mine(num_negatives: int = 4, range_min: int = 1, range_max: int = 200,
 
     False-negative guards (§4.2 / RISKS R8 — do not mine unlabeled positives):
       * mine_hard_negatives itself never returns a row's OWN positive.
-      * A query's OTHER labeled positives sit in the corpus too — we do not
-        blocklist them explicitly; instead range_min=1 skips the top hit and the
-        zero margin (absolute_margin/margin=0.0) drops any candidate scoring >=
-        the row's positive, which is exactly the §4.2 recipe for keeping likely
-        (unlabeled or other-labeled) positives out of the negative set.
+      * range_min=10 skips ranks 1-9, where ESCI's UNLABELED true-relevants cluster
+        (only ~a dozen products/query are labeled), so we don't mine them as negatives.
+      * relative_margin=0.05: a candidate must score < positive_sim*(1-0.05) to count as
+        a negative — a scale-aware guard against other-labeled/unlabeled positives that
+        sit just below the row's positive (the §4.2 recipe; supersedes the initial
+        absolute_margin=0.0 which was too loose — Challenger C2).
     """
     import inspect
     import os
@@ -462,12 +508,17 @@ def mine(num_negatives: int = 4, range_min: int = 1, range_max: int = 200,
         "use_faiss": True,          # batched ANN — the whole point of §4.2
         "verbose": True,
     }
-    # margin guard, whatever this ST version calls it (candidate sim must be
-    # strictly below the positive's sim).
-    if "absolute_margin" in supported:
-        kwargs["absolute_margin"] = 0.0
+    # False-negative guard (Challenger C2). ESCI labels only ~a dozen products/query, so
+    # ranks 1-9 are full of UNLABELED true-relevants — range_min=10 clears that zone, and a
+    # RELATIVE margin (candidate sim must be < positive_sim*(1-0.05)) is the scale-aware
+    # defense the ST docs recommend over absolute_margin=0.0 (which lets a candidate 0.001
+    # below the positive through as a "hard negative", i.e. a mislabeled positive).
+    if "relative_margin" in supported:
+        kwargs["relative_margin"] = 0.05
+    elif "absolute_margin" in supported:
+        kwargs["absolute_margin"] = 0.05
     elif "margin" in supported:
-        kwargs["margin"] = 0.0
+        kwargs["margin"] = 0.05
     else:
         print("[mine] NOTE: no margin kwarg in this ST version — relying on range_min only")
     if "corpus" not in supported:

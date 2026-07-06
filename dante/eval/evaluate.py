@@ -124,6 +124,11 @@ def run_all_ablations(engine, queries: dict, qrels: dict,
     #   * bge-reranker-v2-m3           — XLM-R seq-cls, the 2026 production default.
     GTE_MODERNBERT = "Alibaba-NLP/gte-reranker-modernbert-base"
     BGE_V2_M3 = "BAAI/bge-reranker-v2-m3"
+    # Stretch (Challenger C5 #2): a 2B LLM-based reranker, materially higher BEIR than the
+    # ~0.5B CE rerankers. "Max accuracy, latency irrelevant" + it only ever sees 200
+    # candidates, so it's cheap at eval time. Falls back to fusion order if the rerankers
+    # lib can't load it on this stack (the row then just equals the fusion numbers).
+    BGE_GEMMA = "BAAI/bge-reranker-v2-gemma"
 
     eval_q = _subsample_queries(queries, qrels, max_queries, seed)
     print(f"[ablation] evaluating {len(eval_q)} queries (of {len(queries)} test queries)")
@@ -172,6 +177,7 @@ def run_all_ablations(engine, queries: dict, qrels: dict,
         # stronger, Apache-2.0 CE models isolated against ColBERT and each other.
         "+ CE rerank (gte-modernbert)": lambda q: _ce_rank(q, GTE_MODERNBERT),
         "+ CE rerank (bge-v2-m3)":      lambda q: _ce_rank(q, BGE_V2_M3),
+        "+ LLM rerank (bge-v2-gemma)":  lambda q: _ce_rank(q, BGE_GEMMA),
         # Best v0.1 pair, re-fused at the sweep's sweet-spot constant.
         "Dense+SPLADE (RRF k=30)":
             lambda q: _fused_custom(q, ("dense", "splade"), k=30),
