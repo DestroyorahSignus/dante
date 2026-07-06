@@ -477,6 +477,15 @@ def mine(num_negatives: int = 4, range_min: int = 1, range_max: int = 100,
     print(f"[mine] mine_hard_negatives kwargs: "
           f"{ {k: (f'<{len(v):,} texts>' if k == 'corpus' else v) for k, v in kwargs.items()} }")
 
+    # datasets>=4 returns a lazy `Column` from ds["col"]; ST 4.1's mine_hard_negatives
+    # calls .copy() on it (it expected the old list return) -> AttributeError. Patch the
+    # RUNTIME column type (version-proof: taken from the actual object) with a .copy()
+    # that materializes a plain list — surgical shim, no image/datasets downgrade.
+    _col_t = type(train_ds["anchor"])
+    if not isinstance(train_ds["anchor"], list) and not hasattr(_col_t, "copy"):
+        _col_t.copy = lambda self: list(self)
+        print(f"[mine] shimmed {_col_t.__name__}.copy() for ST-4.1 compat (datasets>=4 lazy Column)")
+
     mined = mine_hard_negatives(train_ds, model, **kwargs)
 
     neg_cols = [c for c in mined.column_names if c.startswith("negative")]
