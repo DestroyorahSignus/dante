@@ -91,7 +91,7 @@ def _format_table(results: dict, ks=(10, 50, 100, 200)) -> str:
 
 def run_all_ablations(engine, queries: dict, qrels: dict,
                       ks=(10, 50, 100, 200), max_queries: int = 2000,
-                      seed: int = 42) -> dict:
+                      seed: int = 42, partial_sink=None) -> dict:
     """Run the ablation configs through the shared ``evaluate_ranker`` (§5.2).
 
     Configs: BM25, Dense, SPLADE, Dense+BM25, Dense+SPLADE, Dense+BM25+SPLADE,
@@ -183,7 +183,11 @@ def run_all_ablations(engine, queries: dict, qrels: dict,
         # Cross-encoder reranks of the SAME fused top-200 as the ColBERT row — two
         # stronger, Apache-2.0 CE models isolated against ColBERT and each other.
         "+ CE rerank (gte-modernbert)": lambda q: _rerank(q, "ce", GTE_MODERNBERT),
-        "+ CE rerank (bge-v2-m3)":      lambda q: _rerank(q, "ce", BGE_V2_M3),
+        # NOTE: bge-reranker-v2-m3 DEFERRED — hung for 20+ min in the finish-day sweep
+        # (the rerankers lib mishandles the XLM-R-large checkpoint, apparent CPU/unbatched
+        # fallback). ColBERT (late-interaction) + gte-modernbert-base (CE) already give the
+        # late-interaction-vs-cross-encoder comparison. Re-enable once the loader is fixed.
+        # "+ CE rerank (bge-v2-m3)":      lambda q: _rerank(q, "ce", BGE_V2_M3),
         # NOTE: bge-reranker-v2-gemma (2B) is DEFERRED at eval scale — 2000q x 200 cands
         # through a 2B LLM reranker is impractical for the finish-day ablation (hours). The
         # three sub-1B rerankers above (ColBERT late-interaction + 2 CE) cover the
@@ -199,8 +203,21 @@ def run_all_ablations(engine, queries: dict, qrels: dict,
 
     results = {}
     for name, rank_fn in configs.items():
-        print(f"[ablation] running config: {name}")
-        results[name] = evaluate_ranker(rank_fn, eval_q, qrels, ks=ks)
+        print(f"[ablation] running config: {name}", flush=True)
+        m = evaluate_ranker(rank_fn, eval_q, qrels, ks=ks)
+        results[name] = m
+        # Print each row's key metrics IMMEDIATELY (not just in the final table) so a
+        # slow/hung later config can never hide earlier results — esp. the Dense R@200
+        # winner-selection number. Also stream a partial dump if a sink was provided.
+        print(f"[ablation] RESULT {name}: "
+              f"R@200={m.get('recall@200', 0):.4f}  R@100={m.get('recall@100', 0):.4f}  "
+              f"nDCG@10={m.get('ndcg@10', 0):.4f}  MRR@10={m.get('mrr@10', 0):.4f}",
+              flush=True)
+        if partial_sink is not None:
+            try:
+                partial_sink(dict(results))
+            except Exception as _exc:  # never let a write error kill the sweep
+                print(f"[ablation] partial-write warning: {_exc}", flush=True)
 
     table = _format_table(results, ks=ks)
     print("\n" + table + "\n")

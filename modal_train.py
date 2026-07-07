@@ -607,11 +607,23 @@ def run_ablation(model_dir: str = "biencoder_final", index_dir: str = "index",
         queries = json.load(f)
 
     engine = DanteSearchEngine(cfg)
+
+    # Incremental sink: persist results after EACH config so a slow/hung later config can
+    # never hide earlier rows (esp. the Dense R@200 winner number). Writes a partial file
+    # + commits the volume per config.
+    _partial_path = cfg["eval"]["results_path"].replace(".json", ".partial.json")
+
+    def _sink(partial: dict):
+        with open(_partial_path, "w") as pf:
+            json.dump({"results": partial, "n_queries": None, "partial": True}, pf, indent=2)
+        vol.commit()
+
     out = run_all_ablations(
         engine, queries, qrels,
         ks=tuple(cfg["eval"]["ks"]),
         max_queries=max_queries,
         seed=cfg["eval"]["seed"],
+        partial_sink=_sink,
     )
     with open(cfg["eval"]["results_path"], "w") as f:
         json.dump({"results": out["results"], "n_queries": out["n_queries"]}, f, indent=2)
