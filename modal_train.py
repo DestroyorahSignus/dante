@@ -589,8 +589,11 @@ def build_index(model_dir: str = "biencoder_final", index_dir: str = "index"):
 
 @app.function(image=image, volumes={ARTIFACTS: vol}, gpu="A100-80GB", timeout=4 * 60 * 60)
 def run_ablation(model_dir: str = "biencoder_final", index_dir: str = "index",
-                 results_name: str = "ablation_results.json"):
-    """Load the index + qrels + queries → run the 10-config ablation (§5.2)."""
+                 results_name: str = "ablation_results.json", max_queries: int = 2000):
+    """Load the index + qrels + queries → run the config ablation (§5.2).
+
+    max_queries: subsample cap. 800 is a good R@200-stable, ~2.5x-faster setting for the
+    v0.2 winner-selection sweep (the pure-Python BM25 leg dominates wall-clock at 2000)."""
     import json
 
     from dante.eval.evaluate import run_all_ablations
@@ -607,7 +610,7 @@ def run_ablation(model_dir: str = "biencoder_final", index_dir: str = "index",
     out = run_all_ablations(
         engine, queries, qrels,
         ks=tuple(cfg["eval"]["ks"]),
-        max_queries=cfg["eval"]["max_queries"],
+        max_queries=max_queries,
         seed=cfg["eval"]["seed"],
     )
     with open(cfg["eval"]["results_path"], "w") as f:
@@ -768,7 +771,8 @@ def main(stage: str = "all", epochs: int = 3, batch_size: int = 128, limit: int 
          base_model: str = MODEL_NAME,
          model_dir: str = "biencoder_final", index_dir: str = "index",
          results_name: str = "ablation_results.json", num_negatives: int = 4,
-         mine_range_max: int = 200, mine_output_format: str = "triplet"):
+         mine_range_max: int = 200, mine_output_format: str = "triplet",
+         max_queries: int = 0):
     """Orchestrate the pipeline.
 
     stage: 'all' | 'data' | 'train' | 'mine' | 'index' | 'ablation' | 'preflight'
@@ -807,7 +811,8 @@ def main(stage: str = "all", epochs: int = 3, batch_size: int = 128, limit: int 
     if stage == "ablation":
         print("== STAGE: run_ablation ==")
         print(run_ablation.remote(model_dir=model_dir, index_dir=index_dir,
-                                  results_name=results_name))
+                                  results_name=results_name,
+                                  max_queries=(max_queries if max_queries else 2000)))
     if stage == "preflight":
         print("== STAGE: preflight ==")
         print(preflight.remote(model_dir=model_dir, index_dir=index_dir))

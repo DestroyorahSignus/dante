@@ -177,7 +177,11 @@ def run_all_ablations(engine, queries: dict, qrels: dict,
         # stronger, Apache-2.0 CE models isolated against ColBERT and each other.
         "+ CE rerank (gte-modernbert)": lambda q: _ce_rank(q, GTE_MODERNBERT),
         "+ CE rerank (bge-v2-m3)":      lambda q: _ce_rank(q, BGE_V2_M3),
-        "+ LLM rerank (bge-v2-gemma)":  lambda q: _ce_rank(q, BGE_GEMMA),
+        # NOTE: bge-reranker-v2-gemma (2B) is DEFERRED at eval scale — 2000q x 200 cands
+        # through a 2B LLM reranker is impractical for the finish-day ablation (hours). The
+        # three sub-1B rerankers above (ColBERT late-interaction + 2 CE) cover the
+        # late-interaction-vs-CE comparison. Re-enable for a one-off small-sample run.
+        # "+ LLM rerank (bge-v2-gemma)":  lambda q: _ce_rank(q, BGE_GEMMA),
         # Best v0.1 pair, re-fused at the sweep's sweet-spot constant.
         "Dense+SPLADE (RRF k=30)":
             lambda q: _fused_custom(q, ("dense", "splade"), k=30),
