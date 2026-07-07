@@ -41,6 +41,61 @@ top-200, recall unchanged since it only reorders). SPLADE is the strongest singl
 in-batch-trained dense leg is the weakest — hard-negative mining (next iteration) is the lever to
 lift it. Full numbers in [`ablation_results.json`](ablation_results.json).
 
+## v0.2 — hard-negative fine-tuning
+
+v0.2 does exactly what the v0.1 "Read" note pointed at: it fine-tunes the dense
+bi-encoder on **mined hard negatives** to lift the weakest leg. The winning recipe is
+**`gte-modernbert-base` + hard negatives** (v0.1's MNRL recipe, bs=128, ~5151 steps,
+plus the hard-negative pairs). The dense leg jumps **R@200 0.627 → 0.698 (+11%)** and
+**nDCG@10 0.313 → 0.410**, and the best overall config (**Dense+SPLADE**) reaches
+**R@200 0.7296 / nDCG@10 0.4461**.
+
+v0.1 was evaluated on a 2,000-query test sample, v0.2 on an 800-query sample. The two
+are comparable: the model-independent rows match across samples — BM25 R@200 0.530→0.517,
+SPLADE R@200 0.674→0.677.
+
+| Configuration | R@200 (v0.1) | R@200 (v0.2 gte) | nDCG@10 (v0.1) | nDCG@10 (v0.2 gte) |
+|---|---|---|---|---|
+| BM25 | 0.530 | 0.517 | 0.321 | 0.317 |
+| Dense | 0.627 | **0.698** | 0.313 | **0.410** |
+| SPLADE | 0.674 | 0.677 | 0.434 | 0.432 |
+| Dense + BM25 (RRF) | 0.678 | 0.692 | 0.363 | 0.393 |
+| Dense + SPLADE (RRF) | 0.730 | **0.730** | 0.418 | **0.446** |
+| Dense + BM25 + SPLADE (RRF) | 0.719 | 0.715 | 0.424 | 0.428 |
+| ↑ + ColBERT rerank | 0.719 | 0.715 | **0.448** | 0.446 |
+| ↑ + CE rerank (gte-modernbert) | — | 0.715 | — | 0.330 |
+| Dense + SPLADE (RRF k=30) | — | 0.729 | — | 0.448 |
+| Dense + BM25 + SPLADE (weighted RRF) | — | 0.728 | — | 0.445 |
+
+**Read:** the fine-tune lifts the dense leg by a wide margin (+11% R@200, +0.097 nDCG@10)
+and — crucially — a *stronger dense leg does not fold into a better fused number for free*:
+Dense+SPLADE R@200 is flat (0.730 → 0.730) because SPLADE already covered most of what the
+dense leg was missing, but the *ranking* quality of that same config improves markedly
+(nDCG@10 0.418 → 0.446). The cross-encoder rerank row (nDCG@10 0.330) *underperforms* the
+fusion it reranks — a pretrained-not-fine-tuned CE is the wrong tool at this recall depth —
+so ColBERT stays the reranker of record. Full numbers in
+[`ablation_gte.json`](ablation_gte.json).
+
+### Negative result: the ModernBERT control regressed
+
+The sweep ran a control — **plain `ModernBERT-base` + the same hard negatives** — and it
+**regressed the dense leg to R@200 0.5478**, below v0.1's in-batch 0.627. The lesson is the
+whole point of the release: **hard negatives only help when the backbone is already
+retrieval-pretrained.** ESCI's labels are incomplete, so hard-negative mining inevitably
+scoops up *unlabeled relevants* (false negatives) and trains the model to push them away.
+A retrieval-pretrained backbone (`gte-modernbert-base`) has enough prior structure to
+survive that noise and still net a gain; a raw-MLM backbone (`ModernBERT-base`) gets
+poisoned by it and degrades. v0.2 therefore ships the gte base and keeps the ModernBERT-HN
+run in the repo as the documented control.
+
+### Deferred / dropped from the sweep
+
+- **`bge-reranker-v2-gemma` (2B)** — too slow to rerank at eval scale; dropped.
+- **`bge-reranker-v2-m3`** — the `rerankers` library hangs on load for this checkpoint; dropped.
+- **Big-batch CachedMNRL (bs=2048)** — undertrained at 216 steps (one pass at the large
+  batch is too few optimizer updates); needs epoch/LR retuning before it's a fair comparison,
+  so it's deferred rather than reported. The shipped runs use the bs=128 / ~5151-step recipe.
+
 ## Install
 
 ```
