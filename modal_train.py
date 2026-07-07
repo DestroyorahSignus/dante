@@ -392,6 +392,16 @@ def train_biencoder(epochs: int = 3, batch_size: int = 128,
     )
     print(f"[train] IR eval: {len(ir_queries)} queries / {len(ir_corpus)} corpus docs")
 
+    # Adaptive eval/save cadence: ~15 evals over the whole run regardless of batch size.
+    # (A fixed eval_steps=25 means 8 evals at bs=2048/216-steps but ~200 at bs=128/5150-steps
+    # — the latter adds ~1h of pure IR-eval overhead. Scale it to the actual step count.)
+    import math
+    _steps_per_epoch = max(1, math.ceil(len(train_ds) / batch_size))
+    _total_steps = _steps_per_epoch * epochs
+    _eval_every = max(25, _total_steps // 15)
+    print(f"[train] ~{_total_steps} steps ({_steps_per_epoch}/epoch × {epochs} epochs); "
+          f"eval+save every {_eval_every} steps")
+
     # Keep the historical ckpt dir for the default run (baseline reproducible);
     # non-default output names get their own ckpt dir so runs never mix.
     ckpt_dir = (f"{ARTIFACTS}/biencoder_ckpts" if output_name == "biencoder_final"
@@ -412,9 +422,9 @@ def train_biencoder(epochs: int = 3, batch_size: int = 128,
         # (Challenger C1). NO_DUPLICATES guarantees no repeated text within a batch.
         batch_sampler=BatchSamplers.NO_DUPLICATES,
         eval_strategy="steps",
-        eval_steps=25,
+        eval_steps=_eval_every,
         save_strategy="steps",
-        save_steps=25,
+        save_steps=_eval_every,
         save_total_limit=2,
         load_best_model_at_end=True,
         metric_for_best_model="eval_loss",
