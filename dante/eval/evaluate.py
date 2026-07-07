@@ -133,63 +133,68 @@ def run_all_ablations(engine, queries: dict, qrels: dict,
     eval_q = _subsample_queries(queries, qrels, max_queries, seed)
     print(f"[ablation] evaluating {len(eval_q)} queries (of {len(queries)} test queries)")
 
-    def _colbert_rank(qtext):
-        fused_ids = engine.fused(qtext, legs=("dense", "bm25", "splade"))
-        candidates = [engine.product_db[p] for p in fused_ids if p in engine.product_db]
-        reranked = colbert_rerank(qtext, candidates, top_k=max(ks),
-                                  model=engine.colbert_model)
-        return [c["product_id"] for c in reranked]
+    # PER-QUERY LEG CACHE. The three legs (esp. the pure-Python BM25 leg over ~350K docs)
+    # are the wall-clock bottleneck, and every fusion/reranker config re-derives from them.
+    # Retrieve each leg's top-`leg_top_k` list ONCE per query and reuse across all configs —
+    # fusion is then just cheap RRF math and rerankers only pay their model forward pass.
+    # (Turns ~11x leg-recompute into 1x → the winner-selection sweep finishes in minutes,
+    # not ~1.5h. Results are identical: RRF on a single cached list preserves that leg's
+    # order, so the single-leg rows match engine.<leg>_only exactly on ordered metrics.)
+    _leg_fns = {"dense": engine._dense, "bm25": engine._bm25, "splade": engine._splade}
+    _leg_cache: dict = {}
 
-    def _ce_rank(qtext, model_id):
-        # SAME fused candidates as the ColBERT row — only the reranker differs, so
-        # these rows isolate late-interaction vs cross-encoder reranking (and CE
-        # models against each other). ``ce_rerank`` runs model_type="cross-encoder".
-        fused_ids = engine.fused(qtext, legs=("dense", "bm25", "splade"))
-        candidates = [engine.product_db[p] for p in fused_ids if p in engine.product_db]
-        reranked = ce_rerank(qtext, candidates, top_k=max(ks), model=model_id)
-        return [c["product_id"] for c in reranked]
+    def _legs(qtext):
+        c = _leg_cache.get(qtext)
+        if c is None:
+            c = {name: fn(qtext, engine.leg_top_k) for name, fn in _leg_fns.items()}
+            _leg_cache[qtext] = c
+        return c
 
-    def _fused_custom(qtext, legs, k=None, weights=None):
-        """Like ``engine.fused`` but with a per-config RRF k and/or leg weights.
-
-        Uses the SAME per-leg retrieval helpers (and leg_top_k depth) as
-        ``engine.fused``, so these rows differ from the standard fusion rows
-        ONLY in the fusion constant/weights — a clean ablation.
-        """
-        leg_fns = {"dense": engine._dense, "bm25": engine._bm25, "splade": engine._splade}
-        ranked = [leg_fns[leg](qtext, engine.leg_top_k) for leg in legs]
+    def _fuse(qtext, legs, k=None, weights=None):
+        cache = _legs(qtext)
+        ranked = [cache[leg] for leg in legs]
         fused = reciprocal_rank_fusion(
             ranked, k=engine.rrf_k if k is None else k,
             top_n=engine.top_n, weights=weights,
         )
         return [pid for pid, _ in fused]
 
+    def _rerank(qtext, kind, model_id=None):
+        # SAME cached fused top-N as every other reranker row — only the reranker differs,
+        # so these rows cleanly isolate late-interaction (ColBERT) vs cross-encoder.
+        fused_ids = _fuse(qtext, ("dense", "bm25", "splade"))
+        candidates = [engine.product_db[p] for p in fused_ids if p in engine.product_db]
+        if kind == "colbert":
+            reranked = colbert_rerank(qtext, candidates, top_k=max(ks),
+                                      model=engine.colbert_model)
+        else:
+            reranked = ce_rerank(qtext, candidates, top_k=max(ks), model=model_id)
+        return [c["product_id"] for c in reranked]
+
     configs = {
-        "BM25":                  lambda q: engine.bm25_only(q),
-        "Dense":                 lambda q: engine.dense_only(q),
-        "SPLADE":                lambda q: engine.splade_only(q),
-        "Dense+BM25":            lambda q: engine.fused(q, legs=("dense", "bm25")),
-        "Dense+SPLADE":          lambda q: engine.fused(q, legs=("dense", "splade")),
-        "Dense+BM25+SPLADE":     lambda q: engine.fused(q, legs=("dense", "bm25", "splade")),
-        "+ ColBERT rerank":      _colbert_rank,
+        "BM25":                  lambda q: _fuse(q, ("bm25",)),
+        "Dense":                 lambda q: _fuse(q, ("dense",)),
+        "SPLADE":                lambda q: _fuse(q, ("splade",)),
+        "Dense+BM25":            lambda q: _fuse(q, ("dense", "bm25")),
+        "Dense+SPLADE":          lambda q: _fuse(q, ("dense", "splade")),
+        "Dense+BM25+SPLADE":     lambda q: _fuse(q, ("dense", "bm25", "splade")),
+        "+ ColBERT rerank":      lambda q: _rerank(q, "colbert"),
         # --- v0.2 rows (v0.1-measured: BM25 noisy, k=10-30 > k=60) --------------
         # Cross-encoder reranks of the SAME fused top-200 as the ColBERT row — two
         # stronger, Apache-2.0 CE models isolated against ColBERT and each other.
-        "+ CE rerank (gte-modernbert)": lambda q: _ce_rank(q, GTE_MODERNBERT),
-        "+ CE rerank (bge-v2-m3)":      lambda q: _ce_rank(q, BGE_V2_M3),
+        "+ CE rerank (gte-modernbert)": lambda q: _rerank(q, "ce", GTE_MODERNBERT),
+        "+ CE rerank (bge-v2-m3)":      lambda q: _rerank(q, "ce", BGE_V2_M3),
         # NOTE: bge-reranker-v2-gemma (2B) is DEFERRED at eval scale — 2000q x 200 cands
         # through a 2B LLM reranker is impractical for the finish-day ablation (hours). The
         # three sub-1B rerankers above (ColBERT late-interaction + 2 CE) cover the
         # late-interaction-vs-CE comparison. Re-enable for a one-off small-sample run.
-        # "+ LLM rerank (bge-v2-gemma)":  lambda q: _ce_rank(q, BGE_GEMMA),
         # Best v0.1 pair, re-fused at the sweep's sweet-spot constant.
         "Dense+SPLADE (RRF k=30)":
-            lambda q: _fused_custom(q, ("dense", "splade"), k=30),
+            lambda q: _fuse(q, ("dense", "splade"), k=30),
         # Keep BM25's lexical signal but halve its vote instead of dropping it.
         # weights are parallel to the legs tuple: dense=1.0, bm25=0.5, splade=1.0.
         "Dense+BM25+SPLADE (weighted RRF)":
-            lambda q: _fused_custom(q, ("dense", "bm25", "splade"),
-                                    weights=[1.0, 0.5, 1.0]),
+            lambda q: _fuse(q, ("dense", "bm25", "splade"), weights=[1.0, 0.5, 1.0]),
     }
 
     results = {}
