@@ -15,7 +15,10 @@ importing the module never triggers a model load. Launch with::
 from __future__ import annotations
 
 import html
+import logging
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 # Retriever legs we attribute results to, in display order.
 _LEGS = ("bm25", "dense", "splade")
@@ -48,6 +51,7 @@ def _leg_contributions(engine: Any, query: str, product_ids: list[str],
         try:
             ranked = leg_fn(query, depth)
         except Exception:  # a missing/broken leg must not take the demo down
+            logger.warning("leg %r failed for query %r — skipping", leg, query, exc_info=True)
             continue
         contributions[leg] = {pid for pid in ranked if pid in wanted}
     return contributions
@@ -119,6 +123,7 @@ def _splade_expansion(engine: Any, query: str, top_k_terms: int = 20) -> dict[st
             pairs = visualize_expansion(query, splade, top_k_terms=top_k_terms)
         return {str(term): round(float(weight), 4) for term, weight in pairs}
     except Exception:
+        logger.warning("SPLADE expansion failed for query %r", query, exc_info=True)
         return {}
 
 

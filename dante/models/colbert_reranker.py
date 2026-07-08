@@ -30,15 +30,6 @@ DEFAULT_CROSS_ENCODER = "BAAI/bge-reranker-base"
 _MODEL_CACHE: dict = {}
 
 
-def _candidate_id(c) -> str:
-    """Extract a product id from a candidate (dict or (id, ...) tuple or str)."""
-    if isinstance(c, dict):
-        return str(c.get("product_id") or c.get("id") or c.get("doc_id"))
-    if isinstance(c, (tuple, list)) and c:
-        return str(c[0])
-    return str(c)
-
-
 def _candidate_text(c) -> str:
     """Extract the text to score from a candidate dict (best-effort)."""
     if isinstance(c, dict):

@@ -49,6 +49,8 @@ class BM25Index:
 
         scores = self.bm25.get_scores(str(query).lower().split())
         k = min(top_k, len(self.doc_ids))
+        if k <= 0:  # mirror SpladeEncoder.search — argpartition(-0)[-0:] returns EVERYTHING
+            return []
         # argpartition for the top-k, then sort just those k (cheaper than full sort).
         top_idx = np.argpartition(scores, -k)[-k:]
         top_idx = top_idx[np.argsort(scores[top_idx])[::-1]]

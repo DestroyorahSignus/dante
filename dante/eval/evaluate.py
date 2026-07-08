@@ -11,8 +11,6 @@ Conventions (§3.4 / §5):
 """
 from __future__ import annotations
 
-import json
-
 from .metrics import ndcg_at_k, recall_at_k, reciprocal_rank
 
 POS_GRADE = 2  # Exact + Substitute count as relevant for recall
@@ -442,17 +440,3 @@ def rrf_k_sweep(engine, queries, qrels, k_values=(10, 30, 60, 100),
     return {"results": results, "table": table, "n_queries": len(eval_q)}
 
 
-def evaluate(engine, qrels, config):
-    """Thin caller that loads queries from config and runs the full ablation (§5.2)."""
-    serving = config.get("serving", {}) if isinstance(config, dict) else {}
-    eval_cfg = config.get("eval", {}) if isinstance(config, dict) else {}
-    queries_path = serving.get("queries_path",
-                               eval_cfg.get("queries_path", "/artifacts/data/queries.json"))
-    with open(queries_path) as f:
-        queries = json.load(f)
-    return run_all_ablations(
-        engine, queries, qrels,
-        ks=tuple(eval_cfg.get("ks", (10, 50, 100, 200))),
-        max_queries=eval_cfg.get("max_queries", 2000),
-        seed=eval_cfg.get("seed", 42),
-    )

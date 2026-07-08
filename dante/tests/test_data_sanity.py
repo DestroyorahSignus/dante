@@ -77,8 +77,12 @@ def test_stats_reports_zero_leakage():
     assert stats.get("leakage", 1) == 0, f"stats.json reports leakage={stats.get('leakage')}"
 
 
-def test_split_ratio_about_ten_percent():
-    """Test-bucket fraction over all judged query ids should be ~10% (md5 %10==0)."""
+def test_all_test_ids_hash_to_test_bucket():
+    """Every id in the (test-only) queries/qrels files must md5-hash to the test bucket.
+
+    NOTE: this does NOT check the ~10% split ratio — queries.json is already the
+    test-only slice, so the fraction here is ~1.0 by construction. The real 10%
+    ratio is asserted at prepare_data time (stats.json)."""
     qrels = _load_json("qrels.json")
     queries = _load_json("queries.json")
     # queries.json = test queries only, so we can't recompute the full ratio from it

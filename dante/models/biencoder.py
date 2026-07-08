@@ -26,7 +26,6 @@ def build_dense_index(model, product_ids: list[str], texts: list[str], batch_siz
         ``(faiss_index, product_ids)``.
     """
     import faiss
-    import numpy as np
 
     if len(product_ids) != len(texts):
         raise ValueError("product_ids and texts must be the same length")
@@ -46,7 +45,6 @@ def dense_search(model, index, product_ids: list[str], query: str, top_k: int = 
     Returns the top-k ``(product_id, score)`` pairs.
     """
     import faiss
-    import numpy as np
 
     q = model.encode([str(query)], convert_to_numpy=True,
                      normalize_embeddings=False).astype("float32")
