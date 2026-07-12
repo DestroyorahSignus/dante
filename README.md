@@ -13,6 +13,70 @@ backbone; the best serving config (**Dense+SPLADE, RRF k=30**) reaches **R@200 0
 nDCG@10 0.448 / MRR@10 0.682**. A controlled A/B showed the *same* hard negatives **regressed**
 a raw-MLM backbone to 0.548 — the central engineering finding below.
 
+> **Status.** Development and evaluation ran on Modal A100s between 2026-06-28 (v0.1) and
+> 2026-07-07 (v0.2.0 tagged). The Modal deployment was **decommissioned 2026-07-09**; trained
+> weights and indices are archived offline, and every pipeline stage rebuilds its artifact from
+> the public dataset — see [Artifacts & archival status](#artifacts--archival-status).
+
+---
+
+## Why hybrid retrieval — and why ESCI is a hard testbed
+
+### Three retrievers, three failure modes
+
+No single retrieval paradigm covers product search on its own, because each one fails in a
+different, *predictable* way:
+
+- **Lexical (BM25)** matches the exact tokens you typed. It nails brand names, model numbers,
+  and SKUs ("Nike Air Max 90") — but it has zero notion of meaning, so "comfy running shoes"
+  finds nothing whose title doesn't literally say "comfy". In our v0.1 ablation BM25 posted a
+  respectable MRR@10 (0.542, *above* the dense leg's 0.531) on the head of the ranking, yet the
+  **worst deep recall of all three legs** (R@200 0.530): once the exact words run out, it has
+  nothing left to offer.
+- **Dense (bi-encoder)** matches meaning: it embeds query and product into one vector space, so
+  "running shoes" ≈ "athletic sneakers". Its failure mode is the inverse — single-vector
+  semantic blur loses the token-precise details (an exact model number is just another word in
+  the soup), and an off-the-shelf or weakly trained encoder ranks confusable-but-wrong products
+  highly. v0.1's in-batch-trained dense leg had good *depth* (R@200 0.627, best of the single
+  legs at that time bar SPLADE) but poor *ordering* (nDCG@10 0.313, barely above BM25).
+- **Learned-sparse (SPLADE)** sits between the two: an MLM head projects text onto a ~30K-term
+  vocabulary with learned weights, *including expansion terms not in the surface text* —
+  "running" also lights up "jog / sprint / athletic". It keeps lexical precision while buying
+  back semantic coverage, and it was the strongest single leg in every ablation we ran (R@200
+  0.674, nDCG@10 0.434).
+
+Because the failure modes are complementary, **rank-based fusion of the legs beats any single
+leg**: Dense+SPLADE reaches R@200 0.730 vs 0.674 for the best single retriever. That is the
+project's thesis, and the ablation table below is its proof. The reranker then addresses what
+fusion cannot: fusion widens the *net*, ColBERT perfects the *order* of what was caught.
+
+### What makes ESCI specifically hard
+
+The Amazon ESCI (Shopping Queries) dataset is real e-commerce search, and it stresses exactly
+the seams between those paradigms:
+
+1. **Graded, sparse labels.** Each judged query-product pair carries one of four human grades —
+   `Exact / Substitute / Complement / Irrelevant` — but only a **handful of products per query
+   are judged at all** (43,151 judgements across 2,150 test queries ≈ ~20 per query, against a
+   351,961-product catalog). Any product outside that labeled set is *unknown*, not *wrong*.
+   This poisons naive hard-negative mining (a top-ranked "negative" is very often an unlabeled
+   relevant — the root of the v0.2 backbone finding below) and it deflates recall metrics:
+   R@10 sits at ~0.2–0.28 for every config simply because most queries have more graded-relevant
+   products than fit in ten slots.
+2. **Keyword-dense product titles.** Amazon product text packs brand, model, attributes, and
+   marketing terms into the title (`title [SEP] brand [SEP] bullets [SEP] description` is what
+   we index). That plays to BM25's strengths on head queries — which is precisely why its
+   MRR@10 stays competitive — while making semantic ordering harder for a dense model that sees
+   near-duplicate keyword soups for confusable products.
+3. **Relevance-only signal.** ESCI carries no ratings, sales, or click data — just the human
+   E/S/C/I grade. There is no behavioral prior to lean on, so retrieval quality has to come
+   entirely from the text and the labels. (A real store would blend behavioral signals into the
+   final ranking; see Limitations.)
+4. **Ambiguous middle grades.** `Complement` (related accessory, not what was asked for — 2.89%
+   of labels) is genuinely ambiguous for contrastive training, so we exclude it from training
+   pairs entirely and count only `Exact`+`Substitute` (grade ≥ 2) as recall-relevant, while nDCG
+   still uses the full graded map.
+
 ---
 
 ## Architecture
@@ -82,6 +146,127 @@ so it lifts ranking metrics (nDCG/MRR) while recall is unchanged.
 
 ---
 
+## Component deep-dives
+
+### Dense bi-encoder — the trained leg
+
+**Backbone.** v0.1 fine-tuned `answerdotai/ModernBERT-base` (150M params, raw MLM pretraining).
+For v0.2 a model-research pass (2026-07-06, every candidate curl-verified for HF gating, license,
+and compatibility with the pinned `transformers 4.57.6 / sentence-transformers 4.1.0` stack)
+selected **`Alibaba-NLP/gte-modernbert-base`**: Apache-2.0, ungated, and the *same* ModernBERT
+architecture — so it drops in via a `--base-model` flag with **zero code change** — but
+**retrieval-pretrained** (BEIR 55.33) instead of MLM-only. That last property turned out to be
+decisive (see the engineering journey). `BAAI/bge-base-en-v1.5` was considered and dropped from
+the retrain roster: it needs instruction-prefix plumbing on the query side to be evaluated
+fairly, and running two *prefix-free* backbones (gte-modernbert vs raw ModernBERT) kept the
+backbone A/B clean. `Qwen3-Embedding-0.6B` is held in reserve as a high-ceiling ablation.
+
+**Training recipe (v0.2 winner).** `MultipleNegativesRankingLoss` (MNRL) over mined triplets:
+- **Data:** 219,764 `(anchor, positive, negative)` triplet rows (see mining below); MNRL in
+  ST 4.x natively treats every column after `(anchor, positive)` as an explicit hard negative
+  on top of the in-batch ones.
+- **Batching:** `bs=128`, 3 epochs ≈ **5,151 optimizer steps**, lr `2e-5`, cosine schedule with
+  `warmup_ratio=0.1`, bf16, `max_seq_length=256`, mean pooling, `attn_implementation="sdpa"`
+  (avoids the optional flash-attn build).
+- **`BatchSamplers.NO_DUPLICATES`** — load-bearing with triplet data: the same `(anchor,
+  positive)` repeats once per mined negative, and if two such rows land in one batch, MNRL
+  treats one row's positive as another row's in-batch negative and pushes an anchor away from
+  its *own* positive. NO_DUPLICATES guarantees no repeated text within a batch.
+- **In-loop eval:** an `InformationRetrievalEvaluator` over a query-disjoint val holdout (capped
+  at 2,000 pairs; corpus = the val positives as a cheap proxy catalog) surfaces nDCG@10 /
+  accuracy@1,10 / MAP@10 during training to catch hard-negative overfit early; best-checkpoint
+  selection uses `eval_loss` (always present → robust). Eval/save cadence is **adaptive** —
+  every `max(25, total_steps // 15)` steps, i.e. ~15 evals per run regardless of batch size — a
+  fixed `eval_steps=25` would have meant ~200 in-loop IR evals at bs=128 (~1h of pure eval
+  overhead). Checkpoints keep `save_total_limit=2`; each `--output-name` gets its own checkpoint
+  dir so runs never mix. Runs log to W&B (project `dante-portfolio`).
+
+**Hard-negative mining (`--stage mine`).** `sentence_transformers.util.mine_hard_negatives`
+with `use_faiss=True` — one batched ANN pass of all training anchors against the **full
+351,961-product catalog**, never the O(Q×N) per-query loop. Parameters: `num_negatives=4`,
+`range_min=10` / `range_max=200` (mine from ranks 10–200), `sampling_strategy="random"` within
+the range for diversity, `relative_margin=0.05`, `output_format="triplet"`, encode
+`batch_size=1024` on the A100. The kwargs are built defensively against the runtime
+`mine_hard_negatives` signature (ST renames `margin` → `absolute_margin`/`relative_margin`
+across versions), and a small runtime shim patches `datasets>=4`'s lazy `Column` type with a
+`.copy()` (ST 4.1 expects the old list return) — surgical, no downgrade.
+
+**Serving.** Products are encoded once and stored in a `faiss.IndexFlatIP`; both document and
+query embeddings are explicitly L2-normalized (inner product = cosine), with a unit-norm assert
+before indexing — an un-normalized `IndexFlatIP` returns plausible-but-wrong rankings, the worst
+kind of bug.
+
+### BM25 — the lexical baseline
+
+A thin wrapper over `rank_bm25.BM25Okapi`. Tokenization is a lowercase whitespace split, applied
+identically on the document and query sides so the leg stays symmetric with its own index.
+Top-k selection uses `np.argpartition` then sorts only the k survivors. The index pickles to
+`(bm25, doc_ids)`. Zero training, minutes to build — and, being pure Python, it is the
+**wall-clock bottleneck** of any full-catalog evaluation, which is what motivated the ablation
+harness's per-query leg cache (below).
+
+### SPLADE — learned sparse (and the license story)
+
+Encoding is the standard SPLADE aggregation: MLM logits → `log1p(relu(logits))`, masked by
+attention, `max` over the sequence dimension → one sparse vector over the WordPiece vocabulary.
+Each non-zero entry is a term with a learned weight, including expansion terms that never appear
+in the input — the repo ships a `visualize_expansion` helper (also used in the demo and as a
+preflight sanity check) that shows exactly which terms a query lit up.
+
+The checkpoint itself was replaced **twice**, both times for supply-chain rather than quality
+reasons:
+
+1. The plan's `naver/splade-v3` turned out to be **gated** on HF (401, requires approval) — a
+   clone-and-run repo can't depend on it. → swapped to the ungated
+   `naver/splade-cocondenser-ensembledistil` (validated in the 2026-06-28 full run).
+2. The finish-day license audit (2026-07-06) found cocondenser-ensembledistil is
+   **CC-BY-NC-SA — non-commercial** — unusable for a commercial-friendly portfolio. → replaced
+   with **`opensearch-project/opensearch-neural-sparse-encoding-v2-distill`**: Apache-2.0,
+   ungated, BEIR avg nDCG@10 ~0.528, and architecturally a standard `DistilBertForMaskedLM`, so
+   it loads via `AutoModelForMaskedLM` and the aggregation code applies **unchanged** (verified
+   against its config.json). `prithivida/Splade_PP_en_v1` was noted as the fallback.
+
+The catalog index stores all document vectors as **one `scipy.sparse` CSR matrix**
+(`[num_docs × vocab_size]`, persisted as `.npz` + a sidecar id list); a query is scored with a
+single sparse matmul `q @ doc_matrix.T` — vectorized, never a per-doc Python loop. A real
+production deployment would use an inverted impact-sorted index (e.g. Anserini); the CSR matmul
+is the honest, fast-enough eval/demo path.
+
+### RRF fusion — plain and weighted
+
+`reciprocal_rank_fusion` implements `RRF(d) = Σ_r w_r / (k + rank_r(d))`. The optional
+`weights` parameter (parallel to the ranked lists; `None` = classic uniform RRF) exists because
+of a v0.2 measurement: adding BM25 as a third leg at full weight slightly *hurt* the best
+two-leg config, but down-weighting BM25's vote to **0.5** (`weights=[1.0, 0.5, 1.0]` for
+dense/bm25/splade) recovered most of the loss — keeping the lexical signal without letting its
+noise swamp the fusion. The constant `k` damps how much rank differences matter (higher k →
+flatter votes, favoring deep consensus; lower k → sharper top-rank emphasis); the sweep below
+found **k=10–30 beats the k=60 default on nDCG@10 at essentially equal R@200**, in both v0.1
+and v0.2.
+
+### ColBERT — the late-interaction reranker
+
+`answerdotai/answerai-colbert-small-v1` (33M params), loaded through AnswerDotAI's `rerankers`
+library — purpose-built for this checkpoint and dependency-light, chosen after pylate (which
+couples to sentence-transformers internals) broke on the newer stack. Unlike the bi-encoder's
+one-vector-per-text, ColBERT keeps a vector per *token* and scores
+`MaxSim(Q,D) = Σ_i max_j (q_i · d_j)`: each query token finds its best-matching document token
+and the maxima are summed. Tokens interact at scoring time (cross-encoder-like quality) but
+documents are pre-encodable (bi-encoder-like cost) — the right trade for reranking a 200-item
+shortlist.
+
+Two implementation contracts worth noting:
+
+- **Never-crash / identity fallback.** Any reranker failure — import error, model-load failure,
+  scoring exception — logs a warning and returns the candidates in their incoming (fused) order.
+  A broken reranker row therefore degrades to the fusion numbers instead of killing a multi-hour
+  ablation. Models are cached per process, keyed by `(model_name, model_type)`.
+- **A generic `rerank(...)`** serves cross-encoder models through the same library and the same
+  contract, which is how the ablation compared late-interaction vs cross-encoder rerankers over
+  *identical* fused candidates.
+
+---
+
 ## Results
 
 Amazon ESCI (US, reduced), query-disjoint split (leakage asserted = 0). Graded qrels
@@ -123,6 +308,83 @@ Full numbers: [`ablation_results.json`](ablation_results.json) (v0.1) and [`eval
 
 ---
 
+## Evaluation methodology
+
+Every number in this README came through **one** code path, and the harness design is half of
+what the project demonstrates.
+
+### One `evaluate_ranker`, one interface
+
+Every configuration — a single leg, a fusion, a reranked pipeline — is expressed as a
+`rank_fn: query_text → ranked product_ids` and evaluated by the same `evaluate_ranker`
+(`dante/eval/evaluate.py`). No config can accidentally use a different nDCG definition, a
+different qrels file, or a different query sample. The ablation is literally a dict of
+`{name: rank_fn}` looped through one function.
+
+### Metrics, exactly as implemented
+
+- **Recall@k** — binary relevance at **grade ≥ 2** (Exact + Substitute): fraction of a query's
+  relevant products found in the top-k. `Complement` and `Irrelevant` never count as relevant.
+- **nDCG@10** — uses the **full graded map** (Exact=3, Substitute=2, Complement=1,
+  Irrelevant=0): `DCG = Σ grade(rank_i)/log2(i+1)` over the top 10, normalized by the ideal DCG
+  from the sorted grade list. Unjudged products score 0.
+- **MRR@10** — reciprocal rank of the *first* grade ≥ 2 hit within the top 10; 0 if none.
+- **Skip-if-no-positive rule** — a query with no grade ≥ 2 judgement has undefined recall/MRR,
+  so it is skipped (not scored as 0) and metrics are averaged only over queries where they are
+  defined. The subsampler applies the same eligibility filter, so every config sees the same
+  denominator.
+
+The metric implementations have hand-computed unit tests (`dante/tests/test_metrics.py`),
+including an exact-value nDCG case.
+
+### The fixed eval sample
+
+The test split holds 2,150 queries; the ablation evaluates a deterministic subsample —
+eligible queries are **sorted, then sampled with `random.Random(seed=42)`** — capped at
+`max_queries=2000` (v0.1). The v0.2 winner-selection sweeps used an 800-query cap: ~2.5× faster
+(the pure-Python BM25 leg dominates wall-clock) and R@200-stable, and validly comparable to
+v0.1 because the model-independent BM25/SPLADE rows reproduced across the two samples. The
+eval-enrichment sweeps (dim truncation, RRF-k) reuse the *same* subsample + seed, which is why
+their 768-d row and k=60 row exactly reproduce the baseline ablation rows — a built-in
+consistency check.
+
+### The leg-cache ablation harness
+
+Naively, every fusion/rerank config re-runs all three retrieval legs per query — the original
+`run_all_ablations` recomputed the ~350K-doc pure-Python BM25 scan **~11×** per query across the
+config list (~1.5h per sweep). The fix: retrieve each leg's top-1000 **once per query**, cache
+it, and derive every config from the cached lists — fusion becomes cheap RRF arithmetic and
+rerankers only pay their own forward pass. The results are **bit-identical** because the legs
+are deterministic and RRF over a single cached list preserves that leg's order, so single-leg
+rows match the direct per-leg search exactly. Sweeps finish in minutes. Two further hardening
+rules: each config's metrics are **printed immediately** and streamed to an incremental
+`.partial.json` (a slow or hung later config can never hide an earlier result), and the partial
+write is wrapped so an I/O error can't kill the sweep.
+
+### Preflight: prove the ceiling before trusting the numbers
+
+Before any real-query metric is believed, a `preflight` stage separates "the encoder/index is
+broken" from "the queries are hard":
+
+1. **FAISS self-test** — encode N catalog docs, query the index with each doc's *own text*,
+   expect it back at rank 1 (asserted > 0.95). Catches normalization bugs (`IndexFlatIP`
+   without L2-norm returns plausible-but-wrong rankings) and encode/index misalignment.
+2. **Retriever ceiling** — the same self-hit test against the **full** dense index: rank-1
+   **0.993** / rank-10 **0.9995**. That is the encoder+index's canonical-query ceiling; real
+   queries score far below it because the task is hard, not because the machinery is broken.
+3. **SPLADE expansion sanity** — a query must expand into a non-empty, positively-weighted,
+   descending term list.
+
+### Data-sanity tests
+
+`dante/tests/test_data_sanity.py` re-derives the invariants the eval depends on, directly from
+the prepared artifacts (skipping cleanly when they're not present on a dev box): the md5 split
+is **recomputed** per query id (not trusted from a flag), `stats.json` must report leakage 0,
+qrels must contain all four grades with Exact the plurality, and the catalog must cover ≥ 99%
+of test-gold positives (otherwise recall would be silently capped by missing pool entries).
+
+---
+
 ## Engineering journey — what we tried
 
 This section is the point of the project: the honest path, including the dead ends.
@@ -141,44 +403,74 @@ mining as the #1 next lever**. v0.2 is that lever.
 
 We mined hard negatives from the full 351,961-product catalog with FAISS
 (`sentence_transformers.util.mine_hard_negatives`, batched ANN — never the O(Q×N) brute-force
-`rank_bm25` loop). Two guards against ESCI's incomplete labels: `range_min=10` (skip ranks 1–9,
-where the ~dozen labeled products/query mean the top is full of *unlabeled* relevants) and
-`relative_margin=0.05` (a candidate must score below `positive_sim × 0.95` to count as a negative).
+`rank_bm25` loop), using the **v0.1 model itself as the miner** (its top-ranked wrong answers
+are, by construction, exactly the confusions the retrained model needs to unlearn). Two guards
+against ESCI's incomplete labels: `range_min=10` (skip ranks 1–9, where the ~dozen labeled
+products/query mean the top is full of *unlabeled* relevants) and `relative_margin=0.05` (a
+candidate must score below `positive_sim × 0.95` to count as a negative — a scale-aware filter,
+unlike an absolute margin of 0.0 which lets a candidate sitting 0.001 below the positive
+through as a "hard negative", i.e. a mislabeled positive).
 
-- **First attempt used `output_format="n-tuple"`** and dropped **83% of rows** — any anchor that
-  couldn't fill all N negative slots was discarded (41,213 of 244,179 survived).
-- **Switching to `output_format="triplet"`** (one row per mined negative) kept **219,764 clean
-  triplets** — 5.3× more data.
+Getting the mining config right took two passes:
+
+- **The first pass used `output_format="n-tuple"` with `range_min=1` and
+  `absolute_margin=0.0`** — and it both **dropped 83% of rows** (any anchor that couldn't fill
+  all N negative slots was discarded: 41,213 of 244,179 survived) *and* mined unlabeled
+  relevants from ranks 1–9.
+- **The corrected pass** — `output_format="triplet"` (one row per mined negative, so every
+  anchor with ≥ 1 negative survives) + `range_min=10` + `relative_margin=0.05` — kept
+  **219,764 clean triplets**: 5.3× more data, with the false-negative guards actually engaged.
+
+### The undertraining red herring
+
+The first retrain on those triplets looked like a strong idea on paper:
+**`CachedMultipleNegativesRankingLoss` at effective batch 2048** (mini-batch 256 via GradCache) —
+"more in-batch negatives = better MNRL" is the standard contrastive-learning lever, and
+GradCache decouples the effective batch from GPU memory. It **regressed** the dense leg
+(ModernBERT-HN measured R@200 0.535, below the v0.1 baseline's 0.627), and the in-loop proxy-IR
+numbers already hinted at trouble during training. It would have been easy to blame the mined
+negatives. Root cause was neither the loss nor the data but the **step count**: 219,764 rows at
+bs=2048 over 2 epochs is only **~216 optimizer steps** (vs v0.1's ~5,700 at bs=128), with a
+learning rate never re-scaled for the huge batch — badly undertrained, warmup barely finished.
+The fix was to return to v0.1's proven recipe *plus* the hard negatives: **bs=128, 3 epochs,
+~5,151 steps, plain MNRL + `BatchSamplers.NO_DUPLICATES`** (triplet data repeats an anchor
+across its negatives; without NO_DUPLICATES two such rows can co-occur in a batch and MNRL
+pushes an anchor off its *own* positive). The same debugging pass also caught an eval-cadence
+bug: a fixed `eval_steps=25` that was fine at 216 steps would have meant ~200 in-loop IR evals
+(~1h of pure overhead) at 5,151 steps — hence the adaptive ~15-evals-per-run cadence. Big-batch
+CachedMNRL is deferred until its epoch/LR schedule is tuned — reporting it as-is would have been
+an unfair comparison.
 
 ### The key insight — a controlled A/B on the backbone
 
-We trained **two** backbones on the **exact same** hard negatives:
+With the recipe fixed, we trained **two** backbones on the **exact same** hard negatives,
+identically in every respect (same triplets, same bs=128/3-epoch/NO_DUPLICATES recipe, same
+harness) — both prefix-free, so the comparison isolates the *pretraining* of the backbone and
+nothing else:
 
 | Backbone | Pretraining | Dense R@200 | vs v0.1 (0.627) |
 |---|---|---|---|
 | `gte-modernbert-base` | retrieval-pretrained | **0.698** | **+11%** |
 | `ModernBERT-base` | raw MLM | 0.548 | **regressed** |
 
-Same data, same recipe, same eval — **opposite outcomes**. Hard negatives only pay off on a
-**retrieval-pretrained** backbone. Because ESCI's labels are sparse, mining inevitably scoops up
-*unlabeled relevants* (false negatives) and trains the model to push them away. A
-retrieval-pretrained backbone has enough prior structure to survive that noise and still net a
-gain; a raw-MLM backbone gets **poisoned** by it and degrades below the in-batch baseline. The
-comparison was clean: the model-independent BM25/SPLADE rows matched across query samples, so the
-delta is attributable to the backbone alone. v0.2 ships `gte-modernbert-base + HN` and keeps the
-ModernBERT-HN run in the repo as the documented control.
+Same data, same recipe, same eval — **opposite outcomes**. (The gap was visible early: during
+training, gte-modernbert's proxy-IR nDCG@10 was 0.307 at eval_loss 0.099 vs ModernBERT-HN's
+0.276 at 0.211.) Hard negatives only pay off on a **retrieval-pretrained** backbone. Because
+ESCI's labels are sparse — ~20 judgements per query against a 351,961-product catalog — mining
+inevitably scoops up *unlabeled relevants* (false negatives) and trains the model to push them
+away. A retrieval-pretrained backbone arrives with a well-formed similarity geometry: the
+false-negative gradient is a perturbation it can absorb while still netting a gain from the
+genuinely-hard negatives. A raw-MLM backbone is building its retrieval geometry *from* this
+data, so the contradictory signal ("push away things that are actually relevant") gets baked
+into the geometry itself — it is **poisoned** by the same triplets and lands below even the
+in-batch v0.1 baseline. The comparison was clean: the model-independent BM25/SPLADE rows matched
+across query samples, so the delta is attributable to the backbone alone. v0.2 ships
+`gte-modernbert-base + HN` and keeps the ModernBERT-HN run in the repo as the documented
+control.
 
-### The undertraining red herring
-
-Before that clean comparison, a first retrain used **`CachedMultipleNegativesRankingLoss` at
-effective batch 2048** (mini-batch 256, GradCache) — the "more in-batch negatives = better MNRL"
-lever. It **regressed** the dense leg. Root cause was not the loss but the **step count**: bs=2048
-over 2 epochs is only **~216 optimizer steps** (vs v0.1's ~5,700 at bs=128) with an unscaled
-learning rate — badly undertrained. The fix was to return to v0.1's proven recipe *plus* the hard
-negatives: **bs=128, 3 epochs, ~5,151 steps, plain MNRL + `BatchSamplers.NO_DUPLICATES`** (triplet
-data repeats an anchor across its negatives; without NO_DUPLICATES two such rows can co-occur in a
-batch and MNRL pushes an anchor off its *own* positive). Big-batch CachedMNRL is deferred until
-its epoch/LR schedule is tuned — reporting it as-is would have been an unfair comparison.
+The practical takeaway generalizes beyond this repo: **on any sparsely-labeled corpus, mined
+hard negatives are only as safe as the prior of the model you fine-tune** — check the backbone's
+pretraining before blaming (or crediting) the mining.
 
 ### Best serving config
 
@@ -224,9 +516,11 @@ worked around:
 ## How to run
 
 The only GPU job is the bi-encoder fine-tune. It is fully isolated on Modal — its own app
-(`dante-train`) and volume (`dante-artifacts`), **no secrets, no database, no shared state**.
-SPLADE and ColBERT use pretrained checkpoints (0h GPU). Artifacts (prepared data, model weights,
-indices, ablation JSON) all live on the `dante-artifacts` volume.
+(`dante-train`) and volume (`dante-artifacts`), **no secrets beyond a W&B API key for run
+tracking, no database, no shared state**. SPLADE and ColBERT use pretrained checkpoints (0h GPU). Artifacts
+(prepared data, model weights, indices, ablation JSON) all live on the `dante-artifacts` volume
+while the deployment is up (see [archival status](#artifacts--archival-status) for the current
+state).
 
 ```bash
 pip install modal && modal token new          # one-time auth
@@ -251,12 +545,46 @@ dim-truncation and RRF-k sweeps). Every stage is idempotent and writes to the vo
 universal recovery from a preemption is "re-run that `--stage`." Pull the trained model with
 `modal volume get dante-artifacts /biencoder_v2 ./models/dante_biencoder`.
 
+### Stage reference
+
+| Stage | Hardware | Reads | Writes | Key flags |
+|---|---|---|---|---|
+| `data` | CPU (8 cores) | `tasksource/esci` (HF, cached on the volume) | `data/{train,val}`, `data/catalog.parquet`, `data/{qrels,queries,stats}.json` | `--limit` (smoke-test row cap) |
+| `mine` | A100 | `biencoder_final`, `data/train`, `data/catalog.parquet` | `data/train_hn` (triplets) | `--num-negatives` (4), `--mine-range-max` (200), `--mine-output-format` (`triplet`) |
+| `train` | A100 | `--train-dir` (`data/train` or `data/train_hn`), `data/val` | `--output-name` model dir + a per-run `*_ckpts/` dir | `--epochs` (3), `--batch-size` (128; >256 switches to CachedMNRL), `--base-model` |
+| `index` | A100 | model dir, catalog | `--index-dir`: `dense.faiss`, `bm25.pkl`, `splade.npz(+.ids.json)`, `product_ids.json` | `--model-dir`, `--index-dir` |
+| `preflight` | A100 | model + index | printed report (asserts FAISS self-test > 0.95) | `--model-dir`, `--index-dir` |
+| `ablation` | A100 | index, qrels, queries | `--results-name` JSON (+ incremental `.partial.json`) | `--max-queries` (2000; 800 for fast sweeps) |
+| `eval_enrich` | A100 | model, index, qrels | `eval_enrich.json` (dim + RRF-k sweeps) | — |
+
+`--stage all` runs `data` + `train` only; the index/eval passes are launched explicitly so they
+don't fire on every smoke test. All defaults reproduce v0.1 exactly — the v0.2 flow is
+opt-in via flags, so a hard-negative run can never clobber the baseline weights (separate
+output/checkpoint/index/results names throughout). Practical tip from the run log: launch long
+sweeps with `modal run --detach` — a detached run survives client disconnects (one RRF sweep
+was cut by a client heartbeat timeout; the detached retry completed cleanly).
+
 Install the package (public API in `dante/__init__.py`: `DanteSearchEngine`, `train_biencoder`,
 `SpladeEncoder`, `BM25Index`, `colbert_rerank`, `reciprocal_rank_fusion`):
 
 ```bash
 pip install git+https://github.com/DestroyorahSignus/dante.git
 ```
+
+`DanteSearchEngine(config)` loads all three indices + models from config paths and exposes both
+the full `search()` pipeline and the per-leg / fused helpers the ablation reuses — every ablation
+row shares production's retrieval code, by construction.
+
+### Artifacts & archival status
+
+The Modal deployment was **decommissioned on 2026-07-09**: the `dante-train` app is gone and the
+`dante-artifacts` volume was deleted after the trained weights (`biencoder_final` v0.1,
+`biencoder_v2` gte-modernbert-HN, and the ModernBERT-HN control), the built indices, and the
+result JSONs were **archived offline**. Nothing in this repo depends on a live URL. The two
+committed result files (`ablation_results.json`, `eval_enrich.json`) preserve the headline
+numbers; everything else is reproducible — each pipeline stage rebuilds its artifact from
+scratch (ESCI is public, SPLADE/ColBERT checkpoints are ungated on HF), so a fresh
+`modal run modal_train.py --stage data` onward recreates the entire artifact chain.
 
 ### Stack (pinned)
 
@@ -288,3 +616,49 @@ val 2,508 · catalog 351,961 products · 2,150 test queries · 43,151 graded jud
 (asserted)**. Split is **by query** (deterministic `hash(query_id) % 10`), never by pair, so no
 query appears in both splits. Product text = `title [SEP] brand [SEP] bullet[:256] [SEP]
 description[:256]`.
+
+### Source and filtering
+
+The pipeline loads the **`tasksource/esci`** HF mirror (single `train` table) and filters to
+**`small_version == 1`** (the reduced ~1.1M-pair variant — the full set is ~2.6M and blows the
+GPU budget) and **`product_locale == "us"`** (locale values on this mirror are `us / es / jp`),
+yielding **427,655 rows**. Two mirror gotchas the code guards against, found in a streaming
+audit before any training: the graded labels are **full words**
+(`Exact / Substitute / Complement / Irrelevant`, mapped 3/2/1/0), *not* single letters — code
+matching `{"E","S"}` silently keeps nothing — and the mirror ships **no official `split`
+column**, so the deterministic hash split below is the live path. ESCI's published label
+distribution: Exact 65.20% / Substitute 21.91% / Complement 2.89% / Irrelevant 10.00%.
+Crucially, the filter keeps **all four labels** — the eval needs the negatives, not just the
+positives. The authoritative `amazon-science/esci-data` parquet is the documented fallback if a
+mirror ever drops the graded label.
+
+### Product text
+
+The code constructs its own `product_text` per product:
+`{title} [SEP] {brand} [SEP] {bullet_point[:256]} [SEP] {description[:256]}` — one string that
+is embedded (dense), encoded (SPLADE), and tokenized (BM25) identically, so all three legs see
+the same document.
+
+### Split and leakage guards
+
+The split is **by query, never by pair** (pair-level splitting leaks the same query into train
+and test and silently inflates every metric): `int(md5(query_id)) % 10 == 0` → test (~10%),
+everything else train. md5 (not Python's salted `hash()`) makes it stable across runs and
+machines. `prepare_data` **asserts** `train_queries ∩ test_queries == ∅` and records the result
+in `stats.json`; `dante/tests/test_data_sanity.py` independently *recomputes* the md5 bucket for
+every id in the eval files and re-asserts zero leakage, plus grade coverage and ≥ 99%
+catalog-covers-gold checks.
+
+### Prepared artifacts
+
+- `data/train`, `data/val` — HF datasets of `(anchor=query, positive=product_text)` pairs:
+  train-split positives at grade ≥ 2, **deduped and capped at 16 per query** (so prolific
+  queries don't dominate the contrastive batches), with a ~1% **query-disjoint** val holdout
+  (seed 42) used only for eval-loss/proxy-IR during training.
+- `data/train_hn` — the mined `(anchor, positive, negative)` triplets (v0.2; written by
+  `--stage mine`, never touching `data/train` so v0.1 stays reproducible).
+- `data/catalog.parquet` — **every unique product** across both splits (351,961): the full
+  retrieval pool. Recall is measured against the whole catalog, not a candidate subset.
+- `data/qrels.json` (`{query_id: {product_id: grade}}`, all four grades) and
+  `data/queries.json` — the graded test-split eval truth.
+- `data/stats.json` — the counts above + the split source + the leakage assertion result.
